@@ -1,4 +1,4 @@
-﻿"""
+"""
 SSSD(Structured State-Space Diffusion) 기반 서울시 아파트 매매가
 다중 시나리오(What-if) 생성 파이프라인
 =================================================================
@@ -94,7 +94,8 @@ ROOT_DIR = BASE_DIR.parent                          # .../newtrial
 DATA_CSV = ROOT_DIR / "data" / "dong_level_meta_table.csv"
 OUT_DIR  = BASE_DIR
 
-TARGET_COL = "reb__apt_sale_avg_price"
+TARGET_LEVEL_COL = "reb__apt_sale_avg_price"  # 원본 가격 (level)
+TARGET_COL       = "target_logret"             # 모델 학습 타겟 = 월간 로그수익률
 TIME_COL   = "timestamp"
 ID_COLS    = ["si", "gu", "dong"]
 
@@ -156,6 +157,11 @@ NOISE_TEMP        = 1.5  # reverse-process posterior noise 온도 배율.
 # --- 진단 ---
 ADF_ALPHA         = 0.05
 
+# --- 추론 대상 동 ---
+# None = 서울 전체 평균(mean aggregation), 문자열이면 해당 동의 past context 사용.
+# CLI: python Diffusion.py --target_dong 개포동
+TARGET_DONG: str | None = None
+
 DEVICE = torch.device("cpu")
 torch.set_num_threads(max(1, (os.cpu_count() or 4) // 2))
 
@@ -163,63 +169,73 @@ torch.set_num_threads(max(1, (os.cpu_count() or 4) // 2))
 # ===========================================================================
 # 2. 데이터 로딩 & 전처리 ( VAR/TFT 와 동일 정신 )
 # ===========================================================================
-def load_and_aggregate(csv_path: Path) -> pd.DataFrame:
-    """동(洞) 단위 패널을 서울 평균(광역) 월별 단변량 다특성 시계열로 집계.
+def load_panel(csv_path: Path) -> pd.DataFrame:
+    """동(洞) 단위 패널 전체를 그대로 로드.
 
-    [근거] Diffusion 학습은 단일 시퀀스만으로도 풍부한 표현이 가능하고,
-           '서울 전체 평균 가격' 이라는 macro 시나리오 해석이 사용자 의도에
-           맞다. (TFT 처럼 panel 사용도 가능하나, 시나리오 분기 해석은
-           광역 한 시계열이 더 명확.)
+    [설계 변경]
+      기존 groupby mean 집계를 완전히 제거하고 패널 그대로 반환.
+      - 학습(train): 243개 동을 독립 시퀀스로 취급 → 슬라이딩 윈도우 수
+        수백(집계 단일) → 수만(패널 전체). 데이터 기아(Data Starvation) 해소.
+      - 추론(inference): TARGET_DONG 에 지정된 특정 동, 또는 서울 전체 평균으로
+        past context 를 구성하여 100-path 생성.
     """
     df = pd.read_csv(csv_path, parse_dates=[TIME_COL])
-    df = df.sort_values([TIME_COL]).reset_index(drop=True)
-
-    feature_cols = [c for c in df.columns if c not in ID_COLS + [TIME_COL]]
-    numeric_cols = [c for c in feature_cols
-                    if pd.api.types.is_numeric_dtype(df[c])]
-
-    monthly = df.groupby(TIME_COL)[numeric_cols].mean().sort_index()
-    return monthly
+    df = df.sort_values([TIME_COL, "dong"]).reset_index(drop=True)
+    return df
 
 
 def clean_missing_and_policy(df: pd.DataFrame) -> pd.DataFrame:
-    """시간축 보간 + policy__ → {-1,0,1} 정수 강제.
+    """동별 시간축 보간 + policy__ → {-1,0,1} 정수 강제.
 
     [파라미터 근거]
-      - interpolate(method="time", limit_direction="both") : 시간 가중 보간.
-        양 끝 NaN 도 가까운 관측치로 채워 학습 윈도우 손실 방지.
+      - groupby(dong): 동마다 결측 패턴이 다를 수 있어 동 내부에서만 보간.
+      - interpolate(method="time", limit_direction="both") : 양 끝 NaN 포함.
       - policy round/clip : 사용자 요구 (강화+1/유지0/완화-1) 의미 보존.
     """
-    out = df.copy().interpolate(method="time", limit_direction="both")
-    out = out.fillna(0.0)
+    out = df.copy().set_index(TIME_COL)
+    feature_cols = [c for c in out.columns if c not in ID_COLS]
+    numeric_cols = [c for c in feature_cols
+                    if pd.api.types.is_numeric_dtype(out[c])]
+    out[numeric_cols] = (
+        out.groupby("dong", group_keys=False)[numeric_cols]
+           .apply(lambda g: g.interpolate(method="time", limit_direction="both"))
+    )
+    out = out.reset_index().fillna(0.0)
     policy_cols = [c for c in out.columns if c.startswith("policy__")]
     out[policy_cols] = out[policy_cols].round().clip(-1, 1).astype(int)
+    # log-return 타겟: 동별 월간 로그수익률 (TFT 와 동일 정통 방식)
+    # P_t / P_{t-1} log-diff → 정상(stationary) 시계열 확보
+    # fillna(0) : 첫 시점은 수익률 = 0 처리
+    out[TARGET_COL] = (
+        out.groupby("dong")[TARGET_LEVEL_COL]
+           .transform(lambda s: np.log(s).diff())
+    ).fillna(0.0).astype(np.float32)
     return out
 
 
 def run_adf_report(df: pd.DataFrame, save_path: Path) -> pd.DataFrame:
-    """주요 수치형 컬럼 각각에 ADF 정상성 검정 → csv 저장 (진단/보고용).
+    """패널 데이터에서 동별 타겟 ADF 검정 → csv 저장 (진단/보고용).
 
     [근거] regression='ct' (상수+추세), autolag='AIC' → VAR/TFT 와 동일 설정.
-           Diffusion 자체는 정상성 가정 불필요하나 사용자 요구 충족.
+           패널 구조: 동별로 TARGET_COL 시리즈에 검정 수행.
     """
     rows = []
-    for col in df.columns:
-        series = df[col].dropna()
+    for dong, grp in df.groupby("dong"):
+        series = grp[TARGET_LEVEL_COL].dropna()  # ADF on level price
         if series.nunique() < 5 or len(series) < 24:
             continue
         try:
             stat, pval, *_ = adfuller(series.values,
                                       regression="ct", autolag="AIC")
-            rows.append({"column": col, "adf_stat": stat, "p_value": pval,
+            rows.append({"dong": dong, "adf_stat": stat, "p_value": pval,
                          "stationary_at_5pct": int(pval < ADF_ALPHA)})
-        except Exception as e:
-            rows.append({"column": col, "adf_stat": np.nan, "p_value": np.nan,
+        except Exception:
+            rows.append({"dong": dong, "adf_stat": np.nan, "p_value": np.nan,
                          "stationary_at_5pct": 0})
     report = pd.DataFrame(rows)
     report.to_csv(save_path, index=False)
     n_stat = int(report["stationary_at_5pct"].sum())
-    print(f"[ADF] stationary(0.05) = {n_stat}/{len(report)} columns")
+    print(f"[ADF] stationary(0.05) = {n_stat}/{len(report)} dong")
     return report
 
 
@@ -227,17 +243,23 @@ def run_adf_report(df: pd.DataFrame, save_path: Path) -> pd.DataFrame:
 # 3. Robust 스케일링 + 슬라이딩 윈도우 데이터셋
 # ===========================================================================
 def fit_scalers(train_df: pd.DataFrame):
-    """타겟과 covariate 를 각각 RobustScaler 로 적합.
+    """패널 학습 데이터 전체에 대해 Global RobustScaler 적합.
 
-    [근거] target 과 exog 의 스케일 차이가 매우 큼 (가격 ~1e8, 금리 ~1e0).
-           각각 별도 scaler 로 fit → inverse_transform 시 누설 없음.
+    [근거] 모든 동을 하나의 스케일러로 fit -> Global Model 학습에서
+           동간 가격 스케일이 일치하여 inverse_transform 일관성 보장.
+           quantile_range=(1,99): 2020-21 +93% / 2022 -30% 등 구조적 급등락도
+           outlier 취급 안 하고 스케일 내 보존.
     """
-    target_scaler = RobustScaler(quantile_range=(1, 99)).fit(train_df[[TARGET_COL]].values)
-    cov_cols = [c for c in train_df.columns if c != TARGET_COL]
-    cov_scaler = RobustScaler(quantile_range=(1, 99)).fit(train_df[cov_cols].values)
-    # quantile_range=(1,99) : (5,95) 대비 극단값까지 완전 보존.
-    # 2020-21 고부양 +93% / 2022 급락 -30% 를 outlier 취급 안 하고
-    # 스케일 내에 보존 → 모델이 장기 큰 진폭 변동도 자연스레운 그랄로 학습.
+    target_scaler = RobustScaler(quantile_range=(1, 99)).fit(
+        train_df[[TARGET_COL]].values)
+    cov_cols = [
+        c for c in train_df.columns
+        if c not in (TARGET_COL, TARGET_LEVEL_COL)
+        and c not in ID_COLS + [TIME_COL]
+        and pd.api.types.is_numeric_dtype(train_df[c])
+    ]
+    cov_scaler = RobustScaler(quantile_range=(1, 99)).fit(
+        train_df[cov_cols].values)
     return target_scaler, cov_scaler, cov_cols
 
 
@@ -249,28 +271,39 @@ def transform_df(df: pd.DataFrame, target_scaler: RobustScaler,
     return y, X
 
 
-def build_sliding_windows(y: np.ndarray, X: np.ndarray,
+def build_sliding_windows(panel_df: pd.DataFrame,
+                          target_scaler: RobustScaler,
+                          cov_scaler: RobustScaler,
+                          cov_cols: list,
                           past_len: int, horizon: int):
-    """슬라이딩 윈도우 (past_y, past_X, future_X) → future_y 학습쌍 생성.
+    """패널 데이터를 동별로 순회하여 슬라이딩 윈도우 생성 후 vstack.
 
     [근거]
-      - 학습 1 sample = (인코더 36 + 디코더 12) 의 multivariate window.
-      - exogenous (covariate) 는 학습 시점에서 미래 구간이 "known input" 으로
-        주어진다고 가정 (sklearn-style covariate / TFT 의 time_varying_known
-        대응). 이를 통해 What-if 시나리오를 covariate 만 바꿔 생성 가능.
+      - 동별 독립 시퀀스: 동 A의 윈도우와 동 B의 윈도우는 서로 다른
+        시계열이므로 옥스테킹 없음. Global Model 학습.
+      - 학습 샘플 수: ~(T-past_len-horizon+1) x N_dong 개.
+        단일 서울 집계 ~140 윈도우 대비 데이터 기아 해소.
     """
-    T = len(y)
-    end = T - past_len - horizon + 1
-    past_y_list, past_X_list, fut_X_list, fut_y_list = [], [], [], []
-    for s in range(end):
-        past_y_list.append(y[s : s + past_len])
-        past_X_list.append(X[s : s + past_len])
-        fut_X_list .append(X[s + past_len : s + past_len + horizon])
-        fut_y_list .append(y[s + past_len : s + past_len + horizon])
-    return (np.stack(past_y_list),
-            np.stack(past_X_list),
-            np.stack(fut_X_list),
-            np.stack(fut_y_list))
+    all_py, all_pX, all_fX, all_fy = [], [], [], []
+    for dong, grp in panel_df.groupby("dong"):
+        grp = grp.sort_values(TIME_COL)
+        y_d = target_scaler.transform(
+            grp[[TARGET_COL]].values).astype(np.float32).flatten()
+        X_d = cov_scaler.transform(
+            grp[cov_cols].values).astype(np.float32)
+        T = len(y_d)
+        end = T - past_len - horizon + 1
+        if end < 1:
+            continue
+        for s in range(end):
+            all_py.append(y_d[s : s + past_len])
+            all_pX.append(X_d[s : s + past_len])
+            all_fX.append(X_d[s + past_len : s + past_len + horizon])
+            all_fy.append(y_d[s + past_len : s + past_len + horizon])
+    return (np.stack(all_py),
+            np.stack(all_pX),
+            np.stack(all_fX),
+            np.stack(all_fy))
 
 
 def compute_window_weights(fut_y: np.ndarray,
@@ -420,15 +453,39 @@ class SSSDDiffusionNet(nn.Module):
         cond_channels = COND_EMB_DIM
 
         # ---- conditioning encoders ----
-        # past : (past_y, past_X) 를 시계열 channel 로 concat → 1D conv 압축
-        self.past_encoder = nn.Sequential(
+        # past : (past_y, past_X) → 시계열 temporal dynamics 를 LSTM 으로 인코딩.
+        #
+        # [구조 변경 이유]
+        #   기존 nn.AdaptiveAvgPool1d(1) 은 과거 PAST_LEN 시계열 전체를 단일
+        #   스칼라(평균)로 압축한다 → V자 폭등/L자 침체/가속·감속 등 '시간적
+        #   흐름(temporal dynamics)' 이 완전히 소실. 디코더가 "4년 평균 높이"
+        #   만 보고 추세를 이어가지 못해 횡보(mean-reversion) 수렴이 고질화됨.
+        #
+        # [새 구조]
+        #   1) past_conv  : Conv1d 2층 → 국소 패턴(단기 파형/계절성) 추출.
+        #        입력 (B, 1+C, L) → 출력 (B, cond_channels, L)
+        #   2) past_lstm  : 양방향 LSTM → 순서 정보·가속도·방향성 보존.
+        #        입력 (B, L, cond_channels) → 마지막 히든 (B, 2*cond_channels)
+        #        (bidirectional=False 도 되지만 forward-only 이 인과성 맞음)
+        #   3) past_proj  : 히든 → cond_channels Linear (차원 맞춤).
+        #        (B, 2*hidden) → (B, cond_channels)
+        #   forward 에서 결과를 L_fut 길이로 broadcast → 디코더 각 시점에 전달.
+        self.past_conv = nn.Sequential(
             nn.Conv1d(1 + cov_dim, cond_channels, kernel_size=3, padding=1),
             nn.SiLU(),
             nn.Conv1d(cond_channels, cond_channels, kernel_size=3, padding=1),
             nn.SiLU(),
-            # global pool → broadcast 용도. shape : (B, cond_channels, 1)
-            nn.AdaptiveAvgPool1d(1),
         )
+        lstm_hidden = cond_channels // 2          # LSTM hidden per direction
+        self.past_lstm = nn.LSTM(
+            input_size=cond_channels,
+            hidden_size=lstm_hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=False,
+        )
+        # 마지막 히든 (B, lstm_hidden) → (B, cond_channels)
+        self.past_proj = nn.Linear(lstm_hidden, cond_channels)
         # future covariates : (B, cov_dim, L_fut) → cond_channels per-step
         self.future_encoder = nn.Sequential(
             nn.Conv1d(cov_dim, cond_channels, kernel_size=3, padding=1),
@@ -470,10 +527,16 @@ class SSSDDiffusionNet(nn.Module):
         # fut_X  : (B, L_fut,  cov_dim) noisy_y : (B, 1, L_fut)
         B, _, L_fut = noisy_y.shape
 
+        # --- past context : Conv 국소 패턴 → LSTM 시계열 방향성 인코딩 ---
         past_in = torch.cat([past_y.unsqueeze(1),
-                             past_X.transpose(1, 2)], dim=1)   # (B,1+C,L_past)
-        past_vec = self.past_encoder(past_in)                  # (B, cond, 1)
-        past_broad = past_vec.expand(-1, -1, L_fut)            # broadcast
+                             past_X.transpose(1, 2)], dim=1)  # (B, 1+C, L_past)
+        past_conv_out = self.past_conv(past_in)               # (B, cond, L_past)
+        # LSTM 은 (B, L, input_size) 형식 필요
+        lstm_in = past_conv_out.transpose(1, 2)               # (B, L_past, cond)
+        _, (h_n, _) = self.past_lstm(lstm_in)                 # h_n: (1, B, hidden)
+        past_hidden = h_n.squeeze(0)                          # (B, lstm_hidden)
+        past_ctx = self.past_proj(past_hidden)                # (B, cond_channels)
+        past_broad = past_ctx.unsqueeze(-1).expand(-1, -1, L_fut)  # (B, cond, L_fut)
 
         fut_in = fut_X.transpose(1, 2)                         # (B, C, L_fut)
         fut_enc = self.future_encoder(fut_in)                  # (B, cond, L_fut)
@@ -1165,252 +1228,26 @@ SCENARIO_CATEGORY = {
 }
 
 
-# ---------------------------------------------------------------------------
-# [시나리오 구조적 trend prior - 단일 drift fallback]
-# Diffusion 의 conditional sampling 만으로는 covariate perturbation 이
-# mean-reversion prior 를 이기지 못해 모든 시나리오 median 이 횡보 수렴함.
-# 시나리오 의미를 반영한 연환산 drift(%) 를 후처리로 주입한다.
-# diffusion 출력은 short-term dynamics / stochastic noise 를 담당,
-# 본 drift 가 long-horizon direction 을 담당.
-#
-# [SCENARIO_ANNUAL_DRIFT_PCT vs SCENARIO_PHASES 관계]
-#   - 두 dict 는 상충하지 않고 **fallback 관계**:
-#     build_drift_schedule() 에서 SCENARIO_PHASES 에 있으면 phase 사용,
-#     없으면 본 dict 의 단일 drift 를 전 horizon 에 적용.
-#   - 단일 drift 가 적절한 경우 = "국면 전환이 없는 장기 구조적 추세"
-#     → 본 dict 에는 F1~F5 와 baseline 만 등재.
-#   - 국면 전환이 있는 모든 시나리오(A/B/C/D/E/F6/F7) 는
-#     SCENARIO_PHASES 에 정의 → 본 dict 의 fallback 미사용.
-#
-# 근거 (장기 단일 추세):
-#   - F1/F2 : 인플레율(±) 의 부동산 명목가격 hedge 효과
-#   - F3    : 통계청 인구추계 (장기 가구수 감소)
-#   - F4/F5 : 뉴노멈 가정 - 영구 저/고 금리는 본질적으로 phase 전환 없음
-# ---------------------------------------------------------------------------
-SCENARIO_ANNUAL_DRIFT_PCT = {
-    "baseline":                       0.0,   # exog carry-forward = drift 없음
-    "Baseline_Actual":                0.0,   # 실측 covariate = drift 주입 금지
-    # F. 구조적/장기 (phase 전환 없는 영구 추세만 등재)
-    "F1_inflation_grind_higher":     +6.0,   # CPI hedge: +4%/yr 인플레 → 명목가 +6%
-    "F2_inflation_grind_low":        +3.0,   # 저인플레 안정 상승
-    "F3_demographic_decline":        -5.0,   # 인구 감소 수요 둔화 (통계청 추계)
-    "F4_secular_low_rate":          +10.0,   # 영구 저금리 뉴노멈
-    "F5_secular_high_rate":          -5.0,   # 영구 고금리 뉴노멈
-    # A/B/C/D/E/F6/F7 는 SCENARIO_PHASES 에서 정의 (국면 전환 있음)
-}
-
-
-# ---------------------------------------------------------------------------
-# [국면 전환 (regime-switching) 시나리오 phase schedule]
-# 실물 경제는 하나의 국면이 무한 지속되지 않는다:
-#   침체 지속 → 부양책(금리인하, 부동산 규제완화) → 회복
-#   과열 지속 → 긴축(LTV 강화, 금리인상) → 조정 → 정상화
-# 각 시나리오를 [(지속개월, 연환산 drift %), ...] 시퀀스로 표현하여
-# 정책 반응 lag 와 historical episode 길이를 반영한다.
-# 합계가 horizon 보다 짧으면 마지막 phase rate 로 채움.
-# SCENARIO_PHASES 에 없는 시나리오는 SCENARIO_ANNUAL_DRIFT_PCT 단일값 사용
-# (대개 F_ 장기 구조적 시나리오 - 자연스럽게 장기 유지).
-# ---------------------------------------------------------------------------
-SCENARIO_PHASES = {
-    # =====================================================================
-    # A. 금리 시나리오 (통화정책 사이클)
-    # ---------------------------------------------------------------------
-    # 부동산은 금리에 18~24개월 lag 로 반응(주택대출금리→매수심리→실거래).
-    # 모든 금리 충격은 결국 중앙은행 정책 전환(완화↔긴축)으로 반전된다.
-    # =====================================================================
-
-    # 2022 한국 기준금리 0.5% → 3.5% 급등 (16개월 250bp).
-    # 서울 아파트 실거래가 2022.06 정점 → 2023.01 약 -25% (KB).
-    # 그 후 2023.07~ 부분 금리 동결/인하 기대로 점진 반등.
-    # → 18m 급락(-22%) → 24m 횡보(-3%, 고금리 후유증) → 78m 정상화(+5%, 금리정상화 + 인플레 hedge)
-    "A1_rate_shock_hike_2022":    [(18, -22), (24,  -3), (78, +5)],
-
-    # 점진 인상(25bp×수회): 충격 흡수 가능. 2022 같은 급락 없이 24m 완만 하락,
-    # 이후 안정. 한국 2010~2012 (2.0→3.25%) 시기 가격 +2~3%/yr 박스권 참고.
-    "A2_rate_gradual_hike":       [(24,  -8), (96,  +2)],
-
-    # 점진 인하 사이클: 주담대 금리 하락 → 매수 회복. 2014~2016 한국 사례
-    # (3.0→1.25%) 서울 아파트 +8~12%/yr → 이후 정책 규제로 안정화.
-    "A3_rate_gradual_cut":        [(24, +10), (96,  +3)],
-
-    # 제로금리(2020.03 0.5%) + 코로나 유동성: 24m 폭등(+22%/yr 실제 관측치).
-    # 2022 긴축 전환 시 12m 조정(-10%, 2022 shock 축소판) → 정상화.
-    "A4_rate_zero_lower_covid":   [(24, +22), (12, -10), (84, +3)],
-
-    # =====================================================================
-    # B. 정책 시나리오 (부동산 규제 vs 완화)
-    # ---------------------------------------------------------------------
-    # 한국 부동산 정책은 5년 정권 주기로 강한 진폭. 규제 강화기에도
-    # 매물 잠김(공급 위축) 으로 가격이 오히려 상승하는 역설이 반복됨.
-    # =====================================================================
-
-    # 문재인 정부(2017~2022) 26차례 규제: 의도와 달리 서울 아파트
-    # +14%/yr CAGR (실측). 매물 잠김 + 다주택자 회피 + 똘똘한 한 채.
-    # 60m 상승 후 차기 정권 규제완화/시장 피로감으로 24m 조정 → 정상.
-    "B1_policy_full_tight_moonjaein": [(60, +14), (24,  -5), (36, +3)],
-
-    # 윤정부 완화(LTV/DSR/세제): 단기 매수 회복 12%/yr × 2년,
-    # 그 후 공급물량 회복으로 정상 +3%.
-    "B2_policy_full_loose_current":   [(24, +12), (96,  +3)],
-
-    # 수요완화(대출↑) + 세제강화(보유세↑): 두 효과 상쇄, 약한 양 +5%/yr,
-    # 장기 +2% 박스권. 2018~2019 일부 시기 참고.
-    "B3_demand_loose_tax_tight":      [(36,  +5), (84,  +2)],
-
-    # 반대 조합: 수요억제(DSR↑) + 보유세 인하 → 단기 약세, 장기 미온적.
-    "B4_demand_tight_tax_loose":      [(24,  -3), (96,  +1)],
-
-    # 공급 중심(3기 신도시 등): 5년간 안정 상승, 입주 본격화 후 둔화.
-    "B5_neutral_supply_focus":        [(60,  +4), (60,  +2)],
-
-    # =====================================================================
-    # C. 거시충격 시나리오 (글로벌/내부 위기)
-    # ---------------------------------------------------------------------
-    # 급격한 충격 후 정부 부양책(금리인하 + 재정 + 부동산 규제완화)이
-    # 통상 12~24m 내 발동되어 V자 또는 U자 반등을 만듦.
-    # =====================================================================
-
-    # 1970년대 미국 스태그플레이션 재현: 고인플레+저성장 36m 침체(-10%/yr),
-    # 인플레 둔화 후 부동산이 인플레 hedge 자산으로 24m 회복(+5%), 정상 +2%.
-    "C1_stagflation_70s":         [(36, -10), (24,  +5), (60, +2)],
-
-    # 1998 IMF 외환위기 재현: 18m 폭락(-22%/yr, 실제 -25~-30% 수준),
-    # IMF 1999~2000 V자 회복(+18%/yr 24m), 이후 2002 정부 부양 +6% 장기.
-    "C2_recession_imf_type":      [(18, -22), (24, +18), (78, +6)],
-
-    # 2009 글로벌 금융위기 후 한국 V자(2010~) 사례. 단기 강반등 12m(+18%),
-    # 회복 24m(+8%), 장기 정상 +3%.
-    "C3_recovery_v_shape":        [(12, +18), (24,  +8), (84, +3)],
-
-    # 미국 1990년대 골디락스(저물가+안정성장): 5년 견조 +12%/yr,
-    # 사이클 후반 5년 완만 둔화 +3%.
-    "C4_goldilocks":              [(60, +12), (60,  +3)],
-
-    # =====================================================================
-    # D. 수급 시나리오 (입주물량 / 거래량)
-    # ---------------------------------------------------------------------
-    # 한국 아파트 공급은 분양→입주 3년 lag. 부족/과잉 사이클 약 36m.
-    # =====================================================================
-
-    # 입주물량 절벽(2024~2025 서울 사례): 36m 강세 +20%/yr,
-    # 공급 회복 후 24m 둔화 +5%, 장기 +2% 안정.
-    "D1_supply_shortage":         [(36, +20), (24,  +5), (60, +2)],
-
-    # 입주 폭탄(2018~2019 동탄/김포 사례): 36m -12%/yr, 24m 추가 약세 -3%,
-    # 공급 흡수 후 0%.
-    "D2_supply_glut":             [(36, -12), (24,  -3), (60,  0)],
-
-    # 전세 급등(2020~2021 임대차3법) → 전세 보증금 매매 전환 수요:
-    # 18m 매매가 견인 +8%, 안정 +3%, 장기 +2%.
-    "D3_jeonse_crisis":           [(18,  +8), (24,  +3), (78, +2)],
-
-    # 거래절벽(2022~2023 양도세 중과): 가격 하방 압력 18m -8%, 정책완화
-    # 후 횡보 24m, 정상 회복 +2%.
-    "D4_transaction_cliff":       [(18,  -8), (24,   0), (78, +2)],
-
-    # =====================================================================
-    # E. 역사 재현 시나리오 (실제 episode 시간축/CAGR 그대로 복원)
-    # ---------------------------------------------------------------------
-    # 한국 서울 아파트 실거래/KB 통계의 episode 길이와 CAGR 사용.
-    # =====================================================================
-
-    # 2010~2014 서울 장기침체: 글로벌 금융위기 여진 + 미분양 누적.
-    # 48m 약세 -2%/yr (KB 실측 -1~-3%), 이후 72m 정체 0%.
-    "E1_replay_2010_2014_stagnation": [(48,  -2), (72,   0)],
-
-    # 2017~2019 규제기 상승: 36m +16%/yr (실측 +14~18% CAGR),
-    # 2019말~2020초 잠시 조정 -10% × 12m, 이후 정상 +4%.
-    "E2_replay_2017_2019_regulate":   [(36, +16), (12, -10), (72, +4)],
-
-    # 2020~2021 코로나 폭등 (역사상 최대): 24m +30%/yr (실측 +27~35%),
-    # 2022 shock 12m -25%, 2023 바닥 12m 0%, 2024~ 회복 +5% 장기.
-    # 4-phase 가 가장 풍부 - 실제 한국이 거쳐온 trajectory.
-    "E3_replay_2020_2021_boom":       [(24, +30), (12, -25), (12,  0), (72, +5)],
-
-    # 2022 금리 shock 단독 재현: 12m -25%, 2023~24 점진 회복 +12%/18m,
-    # 정상 +4%.
-    "E4_replay_2022_shock":           [(12, -25), (18, +12), (90, +4)],
-
-    # 2023~2025 회복기: 24m +12%/yr (실측 1267→1506 ≈ +9% + 가속),
-    # 이후 정상 +4%.
-    "E5_replay_2023_2025_recovery":   [(24, +12), (96,  +4)],
-
-    # =====================================================================
-    # F. 구조적/장기 시나리오 (10년 이상 지속되는 macro 추세)
-    # ---------------------------------------------------------------------
-    # F1~F5 는 본질적으로 장기 단일 추세 → SCENARIO_ANNUAL_DRIFT_PCT 사용.
-    # F6/F7 만 명확한 phase 전환이 역사적으로 검증됨.
-    # =====================================================================
-
-    # 일본 잃어버린 10년 (1991~2001): 초반 5년 급락 -8%/yr,
-    # 이후 5년 완만 하락 -3% (디플레 정착). 일본 부동산지수 실측 패턴.
-    "F6_japan_lost_decade":       [(60,  -8), (60,  -3)],
-
-    # 한국 1986~1991 3저 호황 (저금리/저유가/저환율) + 88올림픽 + 200만호 공약:
-    # 5년간 주택가격지수 +250% → +28%/yr (실측). 1991 토지공개념 +
-    # 200만호 입주 본격화로 24m 조정 -8%, 이후 정상 +3%.
-    "F7_korea_1986_1991_boom":    [(60, +28), (24,  -8), (36, +3)],
-
-    # F1_inflation_grind_higher    (+6%/yr 장기): 인플레 hedge 자산화
-    # F2_inflation_grind_low       (+3%/yr 장기): 저인플레 안정 상승
-    # F3_demographic_decline       (-5%/yr 장기): 인구감소 수요 둔화
-    # F4_secular_low_rate         (+10%/yr 장기): 영구 저금리 가정
-    # F5_secular_high_rate         (-5%/yr 장기): 영구 고금리 가정
-    # → 단일 drift 가 장기 추세를 더 정확히 표현 (phase 전환 불필요)
-}
-
-
-def build_drift_schedule(scenario_name: str, total_months: int) -> np.ndarray:
-    """시나리오의 월별 연환산 drift(%) 배열 반환 (shape (total_months,))."""
-    phases = SCENARIO_PHASES.get(scenario_name)
-    if phases is None:
-        r = SCENARIO_ANNUAL_DRIFT_PCT.get(scenario_name, 0.0)
-        return np.full(total_months, r, dtype=float)
-    arr = np.zeros(total_months, dtype=float)
-    pos = 0
-    last_r = 0.0
-    for dur, r in phases:
-        end = min(pos + int(dur), total_months)
-        arr[pos:end] = r
-        last_r = r
-        pos = end
-        if pos >= total_months:
-            break
-    if pos < total_months:
-        arr[pos:] = last_r
-    return arr
-
-
-def apply_scenario_trend(paths_orig: np.ndarray,
-                          past_y_last_orig: float,
-                          scenario_name: str) -> np.ndarray:
-    """원 단위 paths 에 시나리오별 phase schedule trend 시프트 적용.
-
-    shift[k] = past_y_last * (prod_{j=0..k-1} (1 + r_j/12) - 1)
-    k=0 → shift=0 (anchor 보존). r_j 는 j 번째 달의 연환산 drift(%).
-    국면 전환(예: boom→crash→정상화)이 cumulative compound 로 자연스럽게 반영됨.
-    """
-    L = paths_orig.shape[1]
-    drift_yr = build_drift_schedule(scenario_name, L)          # (L,)
-    if not np.any(drift_yr != 0.0):
-        return paths_orig
-    monthly_mult = 1.0 + drift_yr / 100.0 / 12.0               # (L,)
-    cumprod = np.cumprod(monthly_mult)                         # (L,)
-    shift_mult = np.empty(L, dtype=float)
-    shift_mult[0] = 1.0
-    shift_mult[1:] = cumprod[:-1]
-    shift = past_y_last_orig * (shift_mult - 1.0)              # (L,)
-    return paths_orig + shift[None, :]
-
 
 # ===========================================================================
 # 9. 후처리 유틸리티 (정규화 역변환, 지표, 차트)
 # ===========================================================================
 def inverse_target(arr_scaled: np.ndarray,
                    target_scaler: RobustScaler) -> np.ndarray:
-    """RobustScaler 역변환 → 원 단위 가격(원/㎡)."""
+    """RobustScaler 역변환 → 로그수익률 원단위(unscaled logret)."""
     flat = arr_scaled.reshape(-1, 1)
     return target_scaler.inverse_transform(flat).reshape(arr_scaled.shape)
+
+
+def logret_to_level(paths_logret: np.ndarray, last_price: float) -> np.ndarray:
+    """로그수익률 paths → 원 단위 가격 level 복원.
+
+    price_t = last_price * exp(sum_{k=0}^{t} logret_k)
+    last_price : 예측 시작 직전 시점의 실제 가격 (anchor).
+    paths_logret : (N_scenarios, horizon) unscaled log-returns.
+    Returns (N_scenarios, horizon) level prices.
+    """
+    return last_price * np.exp(np.cumsum(paths_logret, axis=1))
 
 
 def summarize_paths(paths: np.ndarray, idx: pd.DatetimeIndex,
@@ -1442,18 +1279,23 @@ def compute_metrics(true_vals: np.ndarray,
 # 10. 시나리오 (1)+(2) : 백테스트 (2025-01 ~ 2025-12)
 # ===========================================================================
 def scenario_backtest(full_df: pd.DataFrame) -> dict:
-    """2010 ~ 2024.12 학습 → 2025 12개월 × 100 path 생성, 실측 비교."""
+    """패널 데이터로 학습 -> 2025 12개월 x 100 path, 실측 비교.
+
+    TARGET_DONG 동(또는 서울 평균)의 과거 시퀀스를 기준으로 추론.
+    학습: 모든 동 슬라이딩 윈도우 (Global Model).
+    타겟: target_logret (로그수익률) -> inverse 후 level 복원.
+    """
     print("\n=== Scenario 1+2: Backtest 2025-01 ~ 2025-12 ===")
-    train = full_df.loc[:TRAIN_END]
-    valid = full_df.loc[VALID_START:VALID_END]
+    train = full_df[full_df[TIME_COL] <= TRAIN_END]
+    valid = full_df[(full_df[TIME_COL] >= VALID_START) &
+                    (full_df[TIME_COL] <= VALID_END)]
 
     target_scaler, cov_scaler, cov_cols = fit_scalers(train)
-    y_tr, X_tr = transform_df(train, target_scaler, cov_scaler, cov_cols)
-    y_va, X_va = transform_df(valid, target_scaler, cov_scaler, cov_cols)
 
-    # 학습 윈도우
+    # 패널 전체 학습 윈도우 (동별 루프 + vstack)
     p_y, p_X, f_X, f_y = build_sliding_windows(
-        y_tr, X_tr, PAST_LEN, BACKTEST_HORIZON)
+        train, target_scaler, cov_scaler, cov_cols,
+        PAST_LEN, BACKTEST_HORIZON)
     print(f"[Backtest] training windows = {len(p_y)} "
           f"(past={PAST_LEN}, horizon={BACKTEST_HORIZON})")
 
@@ -1466,100 +1308,114 @@ def scenario_backtest(full_df: pd.DataFrame) -> dict:
     ds = TensorDataset(torch.from_numpy(p_y), torch.from_numpy(p_X),
                        torch.from_numpy(f_X), torch.from_numpy(f_y),
                        torch.from_numpy(w_np))
-    # WeightedRandomSampler : 가중치 비례로 윈도우 재샘플 → 최근/변동 구간 oversample
     sampler = WeightedRandomSampler(weights=torch.from_numpy(w_np).double(),
                                     num_samples=len(w_np), replacement=True)
     loader = DataLoader(ds, batch_size=BATCH_SIZE, sampler=sampler,
                         num_workers=0, drop_last=False)
 
     schedule = DiffusionSchedule()
-    model = SSSDDiffusionNet(cov_dim=X_tr.shape[1]).to(DEVICE)
+    model = SSSDDiffusionNet(cov_dim=len(cov_cols)).to(DEVICE)
     print(f"[Backtest] model params = {sum(p.numel() for p in model.parameters()):,}")
 
     hist = train_diffusion(model, schedule, loader,
                            n_epochs=N_EPOCHS, lr=LEARNING_RATE,
                            log_csv=OUT_DIR / "backtest_train_loss.csv")
 
-    # 추론 : past = train 마지막 PAST_LEN 개월
-    past_y_np = y_tr[-PAST_LEN:]
-    past_X_np = X_tr[-PAST_LEN:]
-    pred_idx  = valid.index
-    truth     = valid[TARGET_COL].values
+    # ------------------------------------------------------------------
+    # 추론: TARGET_DONG 동 또는 서울 전체 평균으로 past context 구성
+    # ------------------------------------------------------------------
+    pred_idx = pd.DatetimeIndex(sorted(valid[TIME_COL].unique()))
+    tgt_dong = TARGET_DONG
+    if tgt_dong is not None and tgt_dong in train["dong"].values:
+        td_tr = train[train["dong"] == tgt_dong].sort_values(TIME_COL)
+        td_va = valid[valid["dong"] == tgt_dong].sort_values(TIME_COL)
+        y_td = target_scaler.transform(
+            td_tr[[TARGET_COL]].values).astype(np.float32).flatten()
+        X_td = cov_scaler.transform(td_tr[cov_cols].values).astype(np.float32)
+        X_va = cov_scaler.transform(td_va[cov_cols].values).astype(np.float32)
+        past_y_np = y_td[-PAST_LEN:]
+        past_X_np = X_td[-PAST_LEN:]
+        last_level = float(td_tr[TARGET_LEVEL_COL].iloc[-1])
+        truth_level = td_va[TARGET_LEVEL_COL].values
+        print(f"[Backtest] inference target = {tgt_dong!r}")
+    else:
+        # Seoul mean fallback
+        mean_tr = (train.groupby(TIME_COL)[[TARGET_COL, TARGET_LEVEL_COL] + cov_cols]
+                        .mean().sort_index())
+        mean_va = (valid.groupby(TIME_COL)[[TARGET_COL, TARGET_LEVEL_COL] + cov_cols]
+                        .mean().sort_index())
+        y_td = target_scaler.transform(
+            mean_tr[[TARGET_COL]].values).astype(np.float32).flatten()
+        X_td = cov_scaler.transform(mean_tr[cov_cols].values).astype(np.float32)
+        X_va = cov_scaler.transform(mean_va[cov_cols].values).astype(np.float32)
+        past_y_np = y_td[-PAST_LEN:]
+        past_X_np = X_td[-PAST_LEN:]
+        last_level = float(mean_tr[TARGET_LEVEL_COL].iloc[-1])
+        truth_level = mean_va[TARGET_LEVEL_COL].values
+        print("[Backtest] inference target = Seoul mean")
 
     # ------------------------------------------------------------------
-    # [국면별 시나리오 백테스트]
-    # 기존 구현은 fut_X = X_va (실측 covariate) 단일 경로로만 sampling →
-    # diffusion noise variation 만 보이고 구조적(금리/정책/매크로/구조) 분기는
-    # 검증 단계에 노출되지 않아 100 path 모두 baseline 근처로 수렴(횡보).
-    #
-    # 개선 : future_X 에 대해 What-if 시나리오 22종 + Baseline_Actual(=X_va)
-    # 을 모두 평가. 메트릭/compare 는 Baseline_Actual 기준(실측 covariate)으로
-    # 산출하여 정확도 비교의 공정성을 유지하면서, 차트에는 모든 시나리오 median
-    # 을 fan 으로 표시 → "실측이 어느 국면 가설에 가장 가까웠는가" 사후 진단 가능.
+    # What-if 시나리오 코바리에이트 구성 + sampling
     # ------------------------------------------------------------------
     scenarios = build_whatif_covariates(X_va, cov_cols, cov_scaler)
-    scenarios = {"Baseline_Actual": X_va, **scenarios}   # 실측 covariate 우선
+    scenarios = {"Baseline_Actual": X_va, **scenarios}
 
-    all_long_rows  = []
-    summary_rows   = {}
-    metrics_rows   = []
-    # 시나리오 trend 시프트 기준점 (anchor 와 동일한 origin)
-    past_y_last_orig = float(inverse_target(
-        past_y_np[-1:].reshape(1, 1), target_scaler).ravel()[0])
+    all_long_rows = []
+    summary_rows  = {}
+    metrics_rows  = []
+
     for name, fut_X_np in scenarios.items():
         print(f"  [backtest sampling] scenario = {name}")
-        paths = sample_scenarios(model, schedule, past_y_np, past_X_np,
-                                 fut_X_np, n_scenarios=N_SCENARIOS)
-        paths_orig = inverse_target(paths, target_scaler)
-        # 시나리오 의미를 반영한 구조적 trend 백본 주입 (k=0 shift=0 → anchor 보존)
-        paths_orig = apply_scenario_trend(paths_orig, past_y_last_orig, name)
-        # trend 적용된 원-단위 paths 로부터 summary 재계산
+        paths_scaled = sample_scenarios(model, schedule, past_y_np, past_X_np,
+                                        fut_X_np, n_scenarios=N_SCENARIOS)
+        # logret 역변환 -> level 복원
+        paths_logret = inverse_target(paths_scaled, target_scaler)  # unscaled logret
+        paths_level  = logret_to_level(paths_logret, last_level)    # (N, L) 가격
+
         summary = pd.DataFrame({
             "timestamp": pred_idx,
-            "q10":  np.quantile(paths_orig, 0.10, axis=0),
-            "median": np.quantile(paths_orig, 0.50, axis=0),
-            "q90":  np.quantile(paths_orig, 0.90, axis=0),
-            "mean": paths_orig.mean(axis=0),
-            "std":  paths_orig.std(axis=0),
+            "q10":    np.quantile(paths_level, 0.10, axis=0),
+            "median": np.quantile(paths_level, 0.50, axis=0),
+            "q90":    np.quantile(paths_level, 0.90, axis=0),
+            "mean":   paths_level.mean(axis=0),
+            "std":    paths_level.std(axis=0),
         })
         summary["scenario"] = name
         summary_rows[name]  = summary
 
-        for i, p in enumerate(paths_orig):
+        for i, p in enumerate(paths_level):
             for ts, v in zip(pred_idx, p):
                 all_long_rows.append({
                     "scenario": name, "scenario_id": i,
                     "timestamp": ts, "value": float(v),
                 })
 
-        m = compute_metrics(truth, summary["median"].values)
+        m = compute_metrics(truth_level, summary["median"].values)
         m = {"scenario": name,
              "category": SCENARIO_CATEGORY.get(name, "Baseline"), **m}
         metrics_rows.append(m)
 
-    # 저장 : long path, per-scenario summary, per-scenario metrics
-    pd.DataFrame(all_long_rows).to_csv(
-        OUT_DIR / "backtest_paths_long.csv", index=False)
+    # 저장
+    pd.DataFrame(all_long_rows).to_csv(OUT_DIR / "backtest_paths_long.csv", index=False)
     pd.concat(summary_rows.values(), ignore_index=True).to_csv(
         OUT_DIR / "backtest_summary_by_scenario.csv", index=False)
     metrics_df = pd.DataFrame(metrics_rows).sort_values("MAE")
     metrics_df.to_csv(OUT_DIR / "backtest_metrics_by_scenario.csv", index=False)
 
-    # 기본(Baseline_Actual) 기준의 단일 compare/metrics (기존 호환)
     base_summary = summary_rows["Baseline_Actual"].drop(columns=["scenario"])
     compare = base_summary.copy()
-    compare["actual"] = truth
+    compare["actual"] = truth_level
     compare.to_csv(OUT_DIR / "backtest_compare.csv", index=False)
-    base_metrics = compute_metrics(truth, base_summary["median"].values)
-    pd.DataFrame([base_metrics]).to_csv(OUT_DIR / "backtest_metrics.csv",
-                                        index=False)
+    base_metrics = compute_metrics(truth_level, base_summary["median"].values)
+    pd.DataFrame([base_metrics]).to_csv(OUT_DIR / "backtest_metrics.csv", index=False)
     print(f"[Backtest] baseline metrics = {base_metrics}")
     print("[Backtest] top-5 best-matching scenarios:")
     print(metrics_df.head(5).to_string(index=False))
 
-    # 차트 : 2010년 이후 전체 실측 + 시나리오 median fan + baseline 밴드
-    hist_idx  = train.index
-    hist_orig = inverse_target(y_tr, target_scaler)
+    # 차트 : 학습 구간 historical (Seoul mean level) + 시나리오 fan
+    hist_level_series = (train.groupby(TIME_COL)[TARGET_LEVEL_COL].mean().sort_index())
+    hist_idx   = hist_level_series.index
+    hist_orig  = hist_level_series.values
 
     cat_colors = {
         "Baseline":    "#1f77b4",
@@ -1573,7 +1429,6 @@ def scenario_backtest(full_df: pd.DataFrame) -> dict:
 
     fig, ax = plt.subplots(figsize=(15, 5))
     ax.plot(hist_idx, hist_orig, color="black", linewidth=1.2, label="historical")
-    # 시나리오별 median 을 카테고리 색으로 표시
     drawn_cats = set()
     for name, summary in summary_rows.items():
         if name == "Baseline_Actual":
@@ -1584,18 +1439,17 @@ def scenario_backtest(full_df: pd.DataFrame) -> dict:
         drawn_cats.add(cat)
         ax.plot(pred_idx, summary["median"], color=col, alpha=0.55,
                 linewidth=1.0, label=lbl)
-    # Baseline_Actual : 굵게 + 밴드
     base = summary_rows["Baseline_Actual"]
     ax.plot(pred_idx, base["median"], color="blue", linewidth=2.2,
             label="Baseline_Actual median")
     ax.fill_between(pred_idx, base["q10"], base["q90"],
-                    color="blue", alpha=0.15, label="Baseline 10–90%")
-    ax.plot(pred_idx, truth, color="red", linewidth=2.2, label="actual")
+                    color="blue", alpha=0.15, label="Baseline 10-90%")
+    ax.plot(pred_idx, truth_level, color="red", linewidth=2.2, label="actual")
     ax.axvline(pd.Timestamp(VALID_START), color="grey", linestyle="--",
                linewidth=0.8, label="forecast start")
-    ax.set_title(f"Backtest 2025 — {len(scenarios)} scenarios × {N_SCENARIOS} paths "
-                 f"(category medians; baseline=실측 covariate)")
-    ax.set_ylabel("apt sale avg price")
+    ax.set_title(f"Backtest 2025 - {len(scenarios)} scenarios x {N_SCENARIOS} paths "
+                 f"(level price; target={tgt_dong or 'Seoul mean'})")
+    ax.set_ylabel("apt sale avg price (level)")
     ax.legend(loc="best", fontsize=8, ncol=2)
     fig.tight_layout()
     fig.savefig(OUT_DIR / "backtest_chart.png", dpi=130)
@@ -1605,30 +1459,27 @@ def scenario_backtest(full_df: pd.DataFrame) -> dict:
             "metrics_by_scenario": metrics_df, "history": hist}
 
 
+
 # ===========================================================================
 # 11. 시나리오 (3) : 미래 10년 × What-if 8종 × 100 path
 # ===========================================================================
 def scenario_future(full_df: pd.DataFrame) -> dict:
-    """전체 데이터(2010~2025)로 재학습 → 2026~2035 What-if 8종 × 100 path."""
+    """전체 패널 데이터로 재학습 -> 2026~2035 What-if 시나리오 x 100 path.
+
+    TARGET_DONG 동(또는 서울 평균)의 마지막 past context 를 anchor 로 사용.
+    log-return 예측 -> level 복원 (logret_to_level).
+    """
     print("\n=== Scenario 3: Future 2026-01 ~ 2035-12 with What-if ===")
 
     target_scaler, cov_scaler, cov_cols = fit_scalers(full_df)
-    y_all, X_all = transform_df(full_df, target_scaler, cov_scaler, cov_cols)
 
-    # 학습 윈도우 (horizon 은 backtest 와 동일 12 사용 - long horizon 직접 학습은
-    # CPU 환경에서 비용 과대 → 12개월 단위 학습 모델로 sliding 추론도 가능하나
-    # 본 파이프라인은 baseline 단순화를 위해 single-shot 120개월 학습 채택.
-    # ※ 미래 horizon=120 로도 학습 가능하지만 윈도우 수가 너무 적어
-    # generalization 이 떨어짐. 절충 : horizon=BACKTEST_HORIZON 로 학습한 모델을
-    # 호출 시 horizon=FUTURE_HORIZON 로 확장.
-    # → 본 구현은 horizon 가변 모델(1D conv) 의 특성을 활용해 FUTURE_HORIZON 로
-    #   바로 학습하지 않고 BACKTEST_HORIZON 로 학습한 뒤 inference 시 길이 확장.
+    # 패널 전체 학습 윈도우
     p_y, p_X, f_X, f_y = build_sliding_windows(
-        y_all, X_all, PAST_LEN, BACKTEST_HORIZON)
+        full_df, target_scaler, cov_scaler, cov_cols,
+        PAST_LEN, BACKTEST_HORIZON)
     print(f"[Future] training windows = {len(p_y)} "
           f"(past={PAST_LEN}, horizon={BACKTEST_HORIZON})")
 
-    # recency + volatility 가중치 (2020+ 급등 구간 강조)
     w_np = compute_window_weights(f_y[:, :, 0] if f_y.ndim == 3 else f_y)
     print(f"[Future] weight stats : min={w_np.min():.3f} "
           f"max={w_np.max():.3f} mean={w_np.mean():.3f} "
@@ -1643,104 +1494,122 @@ def scenario_future(full_df: pd.DataFrame) -> dict:
                         num_workers=0, drop_last=False)
 
     schedule = DiffusionSchedule()
-    model = SSSDDiffusionNet(cov_dim=X_all.shape[1]).to(DEVICE)
+    model = SSSDDiffusionNet(cov_dim=len(cov_cols)).to(DEVICE)
 
     hist = train_diffusion(model, schedule, loader,
                            n_epochs=N_EPOCHS, lr=LEARNING_RATE,
                            log_csv=OUT_DIR / "future_train_loss.csv")
 
-    # baseline future covariate : 마지막 관측치 carry-forward (FUTURE_HORIZON 길이)
+    # ------------------------------------------------------------------
+    # 추론: TARGET_DONG 동 또는 서울 전체 평균으로 past context + anchor 구성
+    # ------------------------------------------------------------------
+    tgt_dong = TARGET_DONG
+    if tgt_dong is not None and tgt_dong in full_df["dong"].values:
+        td_all = full_df[full_df["dong"] == tgt_dong].sort_values(TIME_COL)
+        y_td_all = target_scaler.transform(
+            td_all[[TARGET_COL]].values).astype(np.float32).flatten()
+        X_td_all = cov_scaler.transform(td_all[cov_cols].values).astype(np.float32)
+        past_y_np = y_td_all[-PAST_LEN:]
+        past_X_np = X_td_all[-PAST_LEN:]
+        last_level = float(td_all[TARGET_LEVEL_COL].iloc[-1])
+        last_X_orig = cov_scaler.inverse_transform(X_td_all[-1:])
+        print(f"[Future] inference target = {tgt_dong!r}, last_level = {last_level:,.0f}")
+    else:
+        mean_all = (full_df.groupby(TIME_COL)[[TARGET_COL, TARGET_LEVEL_COL] + cov_cols]
+                           .mean().sort_index())
+        y_all_arr = target_scaler.transform(
+            mean_all[[TARGET_COL]].values).astype(np.float32).flatten()
+        X_all_arr = cov_scaler.transform(mean_all[cov_cols].values).astype(np.float32)
+        past_y_np = y_all_arr[-PAST_LEN:]
+        past_X_np = X_all_arr[-PAST_LEN:]
+        last_level = float(mean_all[TARGET_LEVEL_COL].iloc[-1])
+        last_X_orig = cov_scaler.inverse_transform(X_all_arr[-1:])
+        print(f"[Future] inference target = Seoul mean, last_level = {last_level:,.0f}")
+
+    # baseline future covariate: 마지막 관측치 carry-forward
     fut_idx = pd.date_range(FUTURE_START, FUTURE_END, freq="MS")
     L_fut = len(fut_idx)
-    last_X = X_all[-1:]                                 # (1, C)
-    baseline_fut_X = np.repeat(last_X, L_fut, axis=0)   # (L_fut, C)
+    baseline_fut_X_orig = np.repeat(last_X_orig, L_fut, axis=0)
+    baseline_fut_X = cov_scaler.transform(baseline_fut_X_orig).astype(np.float32)
 
     scenarios = build_whatif_covariates(baseline_fut_X, cov_cols, cov_scaler)
 
-    # ── 각 시나리오의 미래 covariate 경로를 원 단위로 복원하여 저장
-    #    (어떤 시나리오가 어떤 변수 값을 갖는지 후속 분석/감사 가능)
+    # 각 시나리오 covariate 경로 원단위 저장 (감사용)
     cov_long_rows = []
     for name, sc_arr in scenarios.items():
         orig = cov_scaler.inverse_transform(sc_arr)
         for ti, ts in enumerate(fut_idx):
             for ci, c in enumerate(cov_cols):
                 cov_long_rows.append({
-                    "scenario":  name,
-                    "timestamp": ts,
-                    "feature":   c,
-                    "value":     float(orig[ti, ci]),
+                    "scenario": name, "timestamp": ts,
+                    "feature": c, "value": float(orig[ti, ci]),
                 })
-    pd.DataFrame(cov_long_rows).to_csv(
-        OUT_DIR / "future_scenario_covariates.csv", index=False)
+    pd.DataFrame(cov_long_rows).to_csv(OUT_DIR / "future_scenario_covariates.csv",
+                                       index=False)
 
-    # 시나리오 카테고리 메타 저장
     meta = pd.DataFrame([
         {"scenario": n, "category": SCENARIO_CATEGORY.get(n, "Other")}
         for n in scenarios.keys()
     ])
     meta.to_csv(OUT_DIR / "future_scenario_meta.csv", index=False)
 
-    past_y_np = y_all[-PAST_LEN:]
-    past_X_np = X_all[-PAST_LEN:]
-    past_y_last_orig = float(inverse_target(
-        past_y_np[-1:].reshape(1, 1), target_scaler).ravel()[0])
-
     all_long_rows = []
     summary_rows  = {}
 
     for name, fut_X_np in scenarios.items():
         print(f"  [sampling] scenario = {name}")
-        paths = sample_scenarios(model, schedule, past_y_np, past_X_np,
-                                 fut_X_np, n_scenarios=N_SCENARIOS)
-        paths_orig = inverse_target(paths, target_scaler)
-        # 시나리오 의미 반영 trend 백본 (long-horizon 분기)
-        paths_orig = apply_scenario_trend(paths_orig, past_y_last_orig, name)
+        paths_scaled = sample_scenarios(model, schedule, past_y_np, past_X_np,
+                                        fut_X_np, n_scenarios=N_SCENARIOS)
+        paths_logret = inverse_target(paths_scaled, target_scaler)
+        paths_level  = logret_to_level(paths_logret, last_level)
+
         summary = pd.DataFrame({
             "timestamp": fut_idx,
-            "q10":  np.quantile(paths_orig, 0.10, axis=0),
-            "median": np.quantile(paths_orig, 0.50, axis=0),
-            "q90":  np.quantile(paths_orig, 0.90, axis=0),
-            "mean": paths_orig.mean(axis=0),
-            "std":  paths_orig.std(axis=0),
+            "q10":    np.quantile(paths_level, 0.10, axis=0),
+            "median": np.quantile(paths_level, 0.50, axis=0),
+            "q90":    np.quantile(paths_level, 0.90, axis=0),
+            "mean":   paths_level.mean(axis=0),
+            "std":    paths_level.std(axis=0),
         })
         summary["scenario"] = name
         summary_rows[name] = summary
 
-        # 100 path long form
-        for i, p in enumerate(paths_orig):
+        for i, p in enumerate(paths_level):
             for ts, v in zip(fut_idx, p):
                 all_long_rows.append({
                     "scenario": name, "scenario_id": i,
                     "timestamp": ts, "value": v,
                 })
 
-    # 저장
     long_df = pd.DataFrame(all_long_rows)
     long_df.to_csv(OUT_DIR / "future_paths_long.csv", index=False)
-
     summary_all = pd.concat(summary_rows.values(), ignore_index=True)
     summary_all.to_csv(OUT_DIR / "future_summary.csv", index=False)
 
-    # 시나리오별 차트 (medians 한 장 비교)
-    fig, ax = plt.subplots(figsize=(12, 6))
-    history_y = inverse_target(y_all, target_scaler)
-    ax.plot(full_df.index, history_y, color="black",
-            linewidth=1.5, label="history (2010-2025)")
+    # ---- 차트 ----
+    # historical: Seoul mean level (항상 서울 평균으로 표시)
+    hist_level_series = (full_df.groupby(TIME_COL)[TARGET_LEVEL_COL].mean().sort_index())
+    hist_idx_plt = hist_level_series.index
+    history_y    = hist_level_series.values
 
     cmap = plt.get_cmap("tab20")
+
+    # 전체 시나리오 median 비교 차트
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(hist_idx_plt, history_y, color="black",
+            linewidth=1.5, label="history (2010-2025)")
     for k, (name, summ) in enumerate(summary_rows.items()):
         ax.plot(summ["timestamp"], summ["median"],
                 color=cmap(k % 20), linewidth=1.5, label=name, alpha=0.85)
-    ax.set_title(f"Future 2026-2035 — {N_SCENARIOS} paths/scenario "
-                 f"({len(scenarios)} scenarios)")
-    ax.set_ylabel("apt sale avg price")
+    ax.set_title(f"Future 2026-2035 - {N_SCENARIOS} paths/scenario "
+                 f"({len(scenarios)} scenarios; target={tgt_dong or 'Seoul mean'})")
+    ax.set_ylabel("apt sale avg price (level)")
     ax.legend(loc="upper left", fontsize=7, ncol=2, bbox_to_anchor=(1.01, 1.0))
     fig.tight_layout()
-    fig.savefig(OUT_DIR / "future_chart_all_medians.png", dpi=130,
-                bbox_inches="tight")
+    fig.savefig(OUT_DIR / "future_chart_all_medians.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
 
-    # 카테고리별 subplot (A/B/C/D/E + baseline 비교)
+    # 카테고리별 subplot
     cats: dict[str, list[str]] = {}
     for name in summary_rows.keys():
         c = SCENARIO_CATEGORY.get(name, "Other")
@@ -1748,10 +1617,10 @@ def scenario_future(full_df: pd.DataFrame) -> dict:
     cat_order = ["A_Rate", "B_Policy", "C_Macro", "D_Supply", "E_Replay"]
     n_cats = len(cat_order)
     fig, axes = plt.subplots(n_cats, 1, figsize=(13, 3.2 * n_cats), sharex=True)
-    base_summ = summary_rows["baseline"]
+    base_summ = summary_rows.get("baseline", next(iter(summary_rows.values())))
     for ax_i, cat_name in zip(axes, cat_order):
         names = cats.get(cat_name, [])
-        ax_i.plot(full_df.index[-60:], history_y[-60:],
+        ax_i.plot(hist_idx_plt[-60:], history_y[-60:],
                   color="black", linewidth=1.2, label="history(last 5y)")
         ax_i.plot(base_summ["timestamp"], base_summ["median"],
                   color="grey", linewidth=1.2, linestyle="--", label="baseline")
@@ -1769,30 +1638,28 @@ def scenario_future(full_df: pd.DataFrame) -> dict:
     fig.suptitle(f"Future scenarios by category ({N_SCENARIOS} paths each)",
                  fontsize=13, y=1.001)
     fig.tight_layout()
-    fig.savefig(OUT_DIR / "future_chart_by_category.png", dpi=130,
-                bbox_inches="tight")
+    fig.savefig(OUT_DIR / "future_chart_by_category.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
 
-    # baseline 시나리오만 별도 100-path 차트
+    # baseline 100-path 차트
     fig, ax = plt.subplots(figsize=(12, 6))
-    base_paths = long_df[long_df["scenario"] == "baseline"]
-    for sid, grp in base_paths.groupby("scenario_id"):
+    base_paths_df = long_df[long_df["scenario"] == "baseline"]
+    for sid, grp in base_paths_df.groupby("scenario_id"):
         ax.plot(grp["timestamp"], grp["value"],
                 color="grey", alpha=0.08, linewidth=0.7)
-    base_summ = summary_rows["baseline"]
     ax.plot(base_summ["timestamp"], base_summ["median"],
             color="blue", linewidth=2, label="baseline median")
     ax.fill_between(base_summ["timestamp"], base_summ["q10"], base_summ["q90"],
-                    color="blue", alpha=0.15, label="10–90% band")
-    ax.plot(full_df.index, history_y, color="black",
-            linewidth=1.2, label="history")
-    ax.set_title(f"Future baseline — all {N_SCENARIOS} sampled paths")
+                    color="blue", alpha=0.15, label="10-90% band")
+    ax.plot(hist_idx_plt, history_y, color="black", linewidth=1.2, label="history")
+    ax.set_title(f"Future baseline - all {N_SCENARIOS} sampled paths")
     ax.legend()
     fig.tight_layout()
     fig.savefig(OUT_DIR / "future_baseline_paths.png", dpi=130)
     plt.close(fig)
 
     return {"summary": summary_all, "history": hist}
+
 
 
 # ===========================================================================
@@ -1824,16 +1691,26 @@ def save_hyperparams() -> None:
 # 13. main
 # ===========================================================================
 def main() -> None:
+    import argparse
+    global TARGET_DONG
+    parser = argparse.ArgumentParser(description="Diffusion 시나리오 모델")
+    parser.add_argument("--target_dong", type=str, default=None,
+                        help="추론 대상 동 이름 (기본값: 서울 전체 평균)")
+    args, _ = parser.parse_known_args()
+    if args.target_dong is not None:
+        TARGET_DONG = args.target_dong
+    print(f"[Config] TARGET_DONG = {TARGET_DONG!r}")
+
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    print("[Step A] Loading & aggregating data ...")
-    raw = load_and_aggregate(DATA_CSV)
-    raw.to_csv(OUT_DIR / "00_seoul_monthly_raw.csv")
+    print("[Step A] Loading panel data ...")
+    raw = load_panel(DATA_CSV)
+    raw.to_csv(OUT_DIR / "00_panel_raw.csv")
 
-    print("[Step A] Cleaning missing + policy normalize ...")
+    print("[Step A] Cleaning missing + policy normalize + log-return ...")
     clean = clean_missing_and_policy(raw)
-    clean.to_csv(OUT_DIR / "01_seoul_monthly_clean.csv")
+    clean.to_csv(OUT_DIR / "01_panel_clean.csv")
 
     print("[Step A] ADF diagnostic ...")
     run_adf_report(clean, OUT_DIR / "02_adf_report.csv")

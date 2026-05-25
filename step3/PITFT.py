@@ -1,4 +1,4 @@
-﻿"""
+"""
 Physics-Informed TFT (PI-TFT) : 거시경제 제약 손실 항을 결합한 서울 아파트 매매가 예측
 =========================================================================
 
@@ -128,7 +128,8 @@ DATA_CSV = ROOT_DIR / "data" / "dong_level_meta_table.csv"
 OUT_DIR  = BASE_DIR
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-TARGET_COL = "reb__apt_sale_avg_price"
+TARGET_LEVEL_COL = "reb__apt_sale_avg_price"  # 원본 가격 (level) — 복원/차트용
+TARGET_COL       = "target_logret"             # 모델 학습 타겟 = 월간 로그수익률
 TIME_COL   = "timestamp"
 ID_COLS    = ["si", "gu", "dong"]
 
@@ -170,7 +171,7 @@ LEARNING_RATE           = 5e-3 # AdamW.
                                 # [변경 3e-2→5e-3] epoch 늘리며 LR 낮춰 수렴 안정.
                                 # 3e-2는 trend 같은 느린 신호를 빠르게 덮어씌움.
 
-BATCH_SIZE              = 128  # CPU 메모리 고려한 중간 값.
+BATCH_SIZE              = 64   # PI Loss 다중 forward pass (1+R회) → OOM 방지.
 
 MAX_EPOCHS              = 40   # [변경 15→40] encoder 5년/패널 학습은 epoch 더 필요.
                                 # 조기종료(patience=8)로 과적합 방지.
@@ -211,35 +212,26 @@ ADF_ALPHA               = 0.05
 #   선별하므로, 일부 컬럼이 panel 에 없어도 silently skip (런타임 안전).
 # ---------------------------------------------------------------------------
 MACRO_RELATIONSHIPS = [
-    # 금리 (할인효과 + 자본조달비용) : 금리↑ → 가격↓
-    #  - BOK 분석 (2022) : 기준금리 +1%p → 수도권 아파트 가격 -2~4% (12~18개월 lag).
-    #  - macro_constraint EXPECTED_RELATIONSHIPS[("base_rate","sale")]=(-1,-0.3,...)
-    ("ecos__base_rate",            -1.0, 1.0,
-     "기준금리↑→매매가↓ (할인율 상승 + 주담대 부담)"),
-
-    # 주담대 금리 (실수요 직접 부담) : 가산금리 포함
-    #  - 한국은행 (2023) DSR 시뮬레이션 : 주담대 +1%p → 매수여력 -8~12%.
-    #  - macro_constraint [("mortgage_rate","sale")]=(-1,-0.4,...)
-    ("ecos__mortgage_rate_new",    -1.0, 1.0,
-     "주담대금리↑→매매가↓ (실수요 매수여력 감소)"),
-
-    # 주거 CPI (실물 인플레 + 임대료 push) : CPI↑ → 가격↑ (인플레 hedge)
-    #  - 통계청 주거 CPI 와 매매가 장기 상관 +0.6 이상.
-    #  - macro_constraint [("cpi_housing","sale")]=(+1,+0.8,...) — 가장 강한 +관계
-    ("ecos__cpi_housing",          +1.0, 0.8,
-     "주거CPI↑→매매가↑ (인플레 헤지 + 임대료 전가)"),
-
-    # 실업률 (소득/심리) : 실업↑ → 가격↓
-    #  - 1998 IMF/2008 GFC 시 실업률 +2%p → 매매가 -10~20% 동행.
-    #  - macro_constraint [("unemployment","sale")]=(-1,-0.4,...)
-    ("ecos__unemployment_rate",    -1.0, 0.5,
-     "실업률↑→매매가↓ (소득 충격 + 매수심리 위축)"),
-
-    # 전세가 (매매-전세 sticky relationship + 갭투자 채널) : 전세↑ → 매매↑
-    #  - KB 주간동향 : 전세가율 70% 돌파 시 매매전환 수요 폭증 (2020-2021).
-    #  - macro_constraint [("jeonse","sale")]=(+1,+0.6,...)
-    ("reb__apt_jeonse_avg_price",  +1.0, 0.8,
-     "전세가↑→매매가↑ (갭투자 + 매수전환 채널)"),
+    # --- 금리/거시 (기존) ---
+    ("ecos__base_rate", -1.0, 1.0, "기준금리↑ → 매매가↓"),
+    ("ecos__mortgage_rate_new", -1.0, 1.0, "주담대금리↑ → 매매가↓"),
+    ("ecos__cpi_housing", +1.0, 0.8, "주거CPI↑ → 매매가↑"),
+    ("ecos__unemployment_rate", -1.0, 0.5, "실업률↑ → 매매가↓"),
+    
+    # --- 수급 (부동산 시장의 물리법칙) ---
+    # 수급지수는 가격과 정방향 동행 (100 이상이 과열, 이하가 침체)
+    ("reb__apt_sale_supply_demand", +1.0, 1.2, "매매수급지수↑ → 매매가↑"),
+    ("reb__apt_jeonse_supply_demand", +1.0, 0.7, "전세수급지수↑ → 매매가↑"),
+    
+    # --- 정책 (한국 부동산의 특수성) ---
+    # 규제 강도(Regime)가 1(tight)일 때 가격은 억제됨 → 예상 부호 -1
+    ("policy__ltv_regime", -1.0, 1.0, "LTV규제강화↑ → 매매가↓"),
+    ("policy__dsr_regime", -1.0, 1.0, "DSR규제강화↑ → 매매가↓"),
+    ("policy__comprehensive_real_estate_tax_regime", -1.0, 0.5, "종부세강화↑ → 매매가↓"),
+    
+    # --- 전세-매매 연동 ---
+    # 전세가율이 높으면 갭투자 수요로 매매가 상승 견인
+    ("reb__apt_jeonse_avg_price", +1.0, 0.9, "전세가↑ → 매매가↑"),
 ]
 
 # Physics-informed loss 가중치 :  λ in  total = main + λ · constraint
@@ -270,21 +262,25 @@ class PhysicsInformedTFT(TemporalFusionTransformer):
     """TFT subclass with macroeconomic directional sensitivity constraint.
 
     training_step 에서 baseline forward 외에 각 macro cause 변수에 대해
-    encoder_cont 의 해당 컬럼을 +PI_PERTURBATION_SIGMA σ 만큼 섭동한 forward 를
+    decoder_cont 의 해당 컬럼을 +PI_PERTURBATION_SIGMA σ 만큼 섭동한 forward 를
     1회씩 추가 수행. Δpred 의 부호가 expected_sign 과 다르면 ReLU penalty.
+
+    [수정 이유: encoder → decoder 섭동]
+      - 목표: "미래 예측 구간(Decoder)의 금리가 올랐을 때 모델 예측이 떨어지는가?"
+      - decoder_cont 는 time_varying_known_reals(기준금리/CPI 등)을 포함
+        → 향후 macro 충격을 직접 제어할 수 있는 커넬.
+      - decoder_cont 는 encoder 보다 짧아 clone 메모리도 효율적.
 
     [구현 주의]
       - forward 추가 호출 비용 : R+1 회 (R = 활성 관계 수).
         PI_APPLY_EVERY_N_BATCHES 로 stochastic 적용.
       - validation/predict 에서는 constraint 계산하지 않음 (속도 + 무의미).
       - self.hparams.x_reals 에서 cause 컬럼 인덱스 lazy 매핑.
-      - encoder_cont 만 섭동 : decoder_cont 의 cause 미래값은 known_real 이
-        아니므로 본 panel 에서는 비어 있어 의미없음.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # lazy-init dict {cause_col -> (encoder_cont 의 channel idx, sign, weight)}
+        # lazy-init dict {cause_col -> (decoder_cont 의 channel idx, sign, weight)}
         self._macro_idx_cache: dict | None = None
         self._batch_counter: int = 0
 
@@ -326,16 +322,17 @@ class PhysicsInformedTFT(TemporalFusionTransformer):
         baseline_avg = baseline_pred[..., q_idx].mean(dim=-1)  # (B,)
 
         total_penalty = baseline_pred.new_tensor(0.0)
-        encoder_cont = x.get("encoder_cont")
-        if encoder_cont is None:
+        decoder_cont = x.get("decoder_cont")
+        if decoder_cont is None:
             return total_penalty
 
         for cause, (ch_idx, sign, weight) in self._macro_idx_cache.items():
-            # encoder_cont 만 채널 섭동 (다른 입력은 공유, in-place 금지를 위해 clone)
-            x_pert = {k: v for k, v in x.items()}
-            ec_pert = encoder_cont.clone()
-            ec_pert[..., ch_idx] = ec_pert[..., ch_idx] + PI_PERTURBATION_SIGMA
-            x_pert["encoder_cont"] = ec_pert
+            # decoder_cont 채널 섭동: 미래 macro 충격에 대한 모델 민감도 평가.
+            # in-place 금지 → decoder_cont 만 clone (인코더보다 짧아 메모리 효율).
+            dc_pert = decoder_cont.clone()
+            dc_pert[..., ch_idx] = dc_pert[..., ch_idx] + PI_PERTURBATION_SIGMA
+            x_pert = {k: (dc_pert if k == "decoder_cont" else v)
+                      for k, v in x.items()}
 
             out_pert = self(x_pert)
             pert_pred = out_pert["prediction"]
@@ -423,6 +420,20 @@ def clean_missing_and_policy(df: pd.DataFrame) -> pd.DataFrame:
     policy_cols = [c for c in out.columns if c.startswith("policy__")]
     out[policy_cols] = out[policy_cols].round().clip(-1, 1).astype(int)
     out[numeric_cols] = out[numeric_cols].fillna(0.0)
+
+    # ------------------------------------------------------------------
+    # [log-return target] 동별로 월간 로그수익률 생성.
+    #   target_logret(t) = log(price(t) / price(t-1))
+    # 첫 월(t=0)은 NaN → 0.0 으로 보정 (min_encoder_length 때문에 해당 행은
+    # 실제 예측 sample 에는 쓰이지 않음).
+    # 원본 가격(TARGET_LEVEL_COL)은 unknown_reals 로 남겨둔다 → encoder 가 절대 수준
+    # context 도 인지 (decoder 에는 안 주므로 누설 없음).
+    # ------------------------------------------------------------------
+    out = out.sort_values(["dong", TIME_COL]).reset_index(drop=True)
+    out[TARGET_COL] = (
+        out.groupby("dong")[TARGET_LEVEL_COL]
+           .transform(lambda s: np.log(s).diff())
+    ).fillna(0.0).astype(np.float32)
     return out
 
 
@@ -563,14 +574,11 @@ def build_training_dataset(df: pd.DataFrame,
         time_varying_known_categoricals=roles["time_varying_known_categoricals"],
         time_varying_known_reals=roles["time_varying_known_reals"],
         time_varying_unknown_reals=roles["time_varying_unknown_reals"],
-        # [정규화 변경] softplus → None, center=False
-        #  - softplus 는 small value 왜곡 + 동별 mean 제거(center=True 기본)로
-        #    장기 trend가 normalized space 에서 사라져 모델이 "잔차의 단기 파형"
-        #    만 학습 → 장기 횡보 + 최근 1년 trend 반복 증상의 핵심 원인.
-        #  - center=False : 동별 평균을 빼지 않음 → trend가 그대로 살아 학습됨.
-        #  - transformation=None : 비선형 왜곡 제거(가격 양수 제약은 scale 만으로 충분).
+        # [정규화] 타겟이 log-return 으로 바뀌면서 장기 trend 문제가 해소되므로
+        # 동별 수익률 평균/스케일을 제거하는 정규화(center=True)로 돌린다.
+        # 이는 NN 학습에서는 표준 관행.
         target_normalizer=GroupNormalizer(
-            groups=["dong"], transformation=None, center=False
+            groups=["dong"], transformation=None, center=True
         ),
         add_relative_time_idx=True,
         add_target_scales=True,
@@ -759,34 +767,31 @@ def scenario_backtest(panel: pd.DataFrame) -> None:
     group_map = {i: d for i, d in enumerate(sorted(df["dong"].unique()))}
     pred_df = _decode_predictions(pred_out, training, idx_to_ts, group_map)
 
-    actual_df = panel[[TIME_COL, "dong", TARGET_COL]].rename(
-        columns={TIME_COL: "timestamp", TARGET_COL: "actual"}
+    # ------------------------------------------------------------------
+    # [Level 복원] 모델 출력은 log-return 공간 → 동별로 누적해 price level 복원.
+    #   price_t = last_price * exp(Σ_{i<=t} pred_logret_i)
+    # 별도의 boundary anchor 불필요 (첫 step 이 자연스럽게 마지막 실측에서 출발).
+    # ------------------------------------------------------------------
+    last_price = (panel[panel[TIME_COL] <= pd.Timestamp(TRAIN_END)]
+                  .sort_values(TIME_COL)
+                  .groupby("dong")[TARGET_LEVEL_COL].last())
+    pred_df = pred_df.sort_values(["dong", "timestamp"]).reset_index(drop=True)
+    recon = []
+    for dong, grp in pred_df.groupby("dong"):
+        if dong not in last_price.index or len(grp) == 0:
+            continue
+        base = float(last_price[dong])
+        g = grp.copy()
+        g["pred_p50"] = base * np.exp(g["pred_p50"].cumsum())
+        g["pred_p10"] = base * np.exp(g["pred_p10"].cumsum())
+        g["pred_p90"] = base * np.exp(g["pred_p90"].cumsum())
+        recon.append(g)
+    pred_df = pd.concat(recon, ignore_index=True)
+
+    actual_df = panel[[TIME_COL, "dong", TARGET_LEVEL_COL]].rename(
+        columns={TIME_COL: "timestamp", TARGET_LEVEL_COL: "actual"}
     )
     compare = pred_df.merge(actual_df, on=["dong", "timestamp"], how="left")
-
-    # ------------------------------------------------------------------
-    # [Boundary anchor] 동별 첫 예측 시점이 마지막 실측과 이격되는 문제
-    # (GroupNormalizer 의 평균회귀 + softplus 왜곡 잔재) 보정.
-    # pred'[k] = pred[k] + (last_actual - pred[0]) * max(0, 1 - k/L)
-    # L=12 → 12개월에 걸쳐 선형으로 이격 흡수 → 이후엔 모델 신호 그대로.
-    # ------------------------------------------------------------------
-    ANCHOR_LEN = 12
-    last_actuals = (panel[panel[TIME_COL] <= pd.Timestamp(TRAIN_END)]
-                    .sort_values(TIME_COL)
-                    .groupby("dong")[TARGET_COL].last())
-    compare = compare.sort_values(["dong", "timestamp"]).reset_index(drop=True)
-    for dong, grp in compare.groupby("dong"):
-        if dong not in last_actuals.index or len(grp) == 0:
-            continue
-        idx = grp.index.to_list()
-        first_pred = compare.loc[idx[0], "pred_p50"]
-        d = float(last_actuals[dong]) - float(first_pred)
-        for k, ridx in enumerate(idx):
-            w = max(0.0, 1.0 - k / float(ANCHOR_LEN))
-            shift = d * w
-            compare.loc[ridx, "pred_p10"] += shift
-            compare.loc[ridx, "pred_p50"] += shift
-            compare.loc[ridx, "pred_p90"] += shift
 
     compare["abs_error"] = (compare["actual"] - compare["pred_p50"]).abs()
     compare.to_csv(OUT_DIR / "backtest_dong_compare.csv", index=False)
@@ -815,7 +820,7 @@ def scenario_backtest(panel: pd.DataFrame) -> None:
     print("[Backtest metrics]\n", metrics.to_string(index=False))
 
     # 차트
-    full_seoul = panel.groupby(TIME_COL)[TARGET_COL].mean().sort_index()
+    full_seoul = panel.groupby(TIME_COL)[TARGET_LEVEL_COL].mean().sort_index()
     plt.figure(figsize=(12, 5))
     plt.plot(full_seoul.index, full_seoul.values,
              label="Actual (2010~2025)", color="#1f77b4")
@@ -827,7 +832,7 @@ def scenario_backtest(panel: pd.DataFrame) -> None:
     plt.axvline(pd.Timestamp(TRAIN_END), color="gray", linestyle=":", alpha=0.7,
                 label="Train End")
     plt.title("TFT Backtest: Seoul Avg Apt Sale Price (per-dong → mean)")
-    plt.xlabel("Date"); plt.ylabel(TARGET_COL)
+    plt.xlabel("Date"); plt.ylabel(TARGET_LEVEL_COL)
     plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
     plt.savefig(OUT_DIR / "backtest_chart.png", dpi=130)
     plt.close()
@@ -891,27 +896,26 @@ def scenario_future(panel: pd.DataFrame) -> None:
     future_pred_df = _decode_predictions(pred_out, training, idx_to_ts, group_map)
 
     # ------------------------------------------------------------------
-    # [Boundary anchor] 마지막 실측(2025-12) → 첫 예측(2026-01) 이격 흡수.
-    # 백테스트와 동일 로직 (12개월 선형 감쇠).
+    # [Level 복원] log-return 공간 예측 → 동별 누적 exp 로 price level 복원.
+    # 마지막 실측(2025-12) 을 base 로 삼아 예측 월별 수익률 누적 적용.
+    # boundary anchor 불필요 (첫 step 이 자연스럽게 마지막 실측에서 출발).
     # ------------------------------------------------------------------
-    ANCHOR_LEN = 12
-    last_actuals = (panel.sort_values(TIME_COL)
-                         .groupby("dong")[TARGET_COL].last())
+    last_price = (panel.sort_values(TIME_COL)
+                       .groupby("dong")[TARGET_LEVEL_COL].last())
     future_pred_df = (future_pred_df
                       .sort_values(["dong", "timestamp"])
                       .reset_index(drop=True))
+    recon = []
     for dong, grp in future_pred_df.groupby("dong"):
-        if dong not in last_actuals.index or len(grp) == 0:
+        if dong not in last_price.index or len(grp) == 0:
             continue
-        idx = grp.index.to_list()
-        first_pred = future_pred_df.loc[idx[0], "pred_p50"]
-        d = float(last_actuals[dong]) - float(first_pred)
-        for k, ridx in enumerate(idx):
-            w = max(0.0, 1.0 - k / float(ANCHOR_LEN))
-            shift = d * w
-            future_pred_df.loc[ridx, "pred_p10"] += shift
-            future_pred_df.loc[ridx, "pred_p50"] += shift
-            future_pred_df.loc[ridx, "pred_p90"] += shift
+        base = float(last_price[dong])
+        g = grp.copy()
+        g["pred_p50"] = base * np.exp(g["pred_p50"].cumsum())
+        g["pred_p10"] = base * np.exp(g["pred_p10"].cumsum())
+        g["pred_p90"] = base * np.exp(g["pred_p90"].cumsum())
+        recon.append(g)
+    future_pred_df = pd.concat(recon, ignore_index=True)
 
     future_pred_df.to_csv(OUT_DIR / "future_dong_forecast.csv", index=False)
 
@@ -921,10 +925,10 @@ def scenario_future(panel: pd.DataFrame) -> None:
                          forecast_p90=("pred_p90", "mean"))
                     .reset_index())
 
-    full_seoul = (panel.groupby(TIME_COL)[TARGET_COL].mean()
+    full_seoul = (panel.groupby(TIME_COL)[TARGET_LEVEL_COL].mean()
                        .sort_index().reset_index()
                        .rename(columns={TIME_COL: "timestamp",
-                                        TARGET_COL: "actual"}))
+                                        TARGET_LEVEL_COL: "actual"}))
     timeline = pd.concat([
         full_seoul.assign(type="actual", forecast=np.nan,
                           forecast_p10=np.nan, forecast_p90=np.nan),
@@ -944,7 +948,7 @@ def scenario_future(panel: pd.DataFrame) -> None:
     plt.axvline(pd.Timestamp("2025-12-01"), color="gray", linestyle=":",
                 alpha=0.7, label="Forecast Start")
     plt.title("TFT 10-Year Forecast: Seoul Avg Apt Sale Price")
-    plt.xlabel("Date"); plt.ylabel(TARGET_COL)
+    plt.xlabel("Date"); plt.ylabel(TARGET_LEVEL_COL)
     plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
     plt.savefig(OUT_DIR / "future_chart.png", dpi=130)
     plt.close()
