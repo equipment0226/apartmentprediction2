@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "C:\Users\equip\Desktop\homework\newtrial\step4\Diffusion.py", line 1501, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\equip\Desktop\homework\newtrial\step4\Diffusion.py", line 1491, in main
+    scenario_backtest(clean)
+    ~~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\equip\Desktop\homework\newtrial\step4\Diffusion.py", line 1241, in scenario_backtest
+    hist_orig = inverse_target(y_tr[np.newaxis, :, 0], target_scaler)[0]  # (N_train,)
+                               ~~~~^^^^^^^^^^^^^^^^^^
+IndexError: too many indices for array: array is 1-dimensional, but 2 were indexed

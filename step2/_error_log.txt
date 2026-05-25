@@ -1,0 +1,52 @@
+Traceback (most recent call last):
+  File "C:\Users\equip\anaconda3\Lib\site-packages\pytorch_forecasting\data\encoders.py", line 418, in transform
+    encoded = [self.classes_[v] for v in y]
+               ~~~~~~~~~~~~~^^^
+KeyError: 'loose'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\equip\Desktop\homework\newtrial\step2\TFT.py", line 736, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\equip\Desktop\homework\newtrial\step2\TFT.py", line 721, in main
+    scenario_backtest(clean)
+    ~~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\equip\Desktop\homework\newtrial\step2\TFT.py", line 494, in scenario_backtest
+    validation = TimeSeriesDataSet.from_dataset(
+        training, df, predict=True, stop_randomization=True
+    )
+  File "C:\Users\equip\anaconda3\Lib\site-packages\pytorch_forecasting\data\timeseries\_timeseries.py", line 1677, in from_dataset
+    return cls.from_parameters(
+           ~~~~~~~~~~~~~~~~~~~^
+        dataset.get_parameters(),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        **update_kwargs,
+        ^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\pytorch_forecasting\data\timeseries\_timeseries.py", line 1739, in from_parameters
+    new = cls(data, **parameters)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\pytorch_forecasting\data\timeseries\_timeseries.py", line 632, in __init__
+    data = self._preprocess_data(data)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\pytorch_forecasting\data\timeseries\_timeseries.py", line 1145, in _preprocess_data
+    data[name] = self.transform_values(
+                 ~~~~~~~~~~~~~~~~~~~~~^
+        name,
+        ^^^^^
+    ...<2 lines>...
+        ignore_na=name in self.lagged_variables,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\pytorch_forecasting\data\timeseries\_timeseries.py", line 1399, in transform_values
+    return transform(values, **kwargs)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\sklearn\utils\_set_output.py", line 316, in wrapped
+    data_to_wrap = f(self, X, *args, **kwargs)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\pytorch_forecasting\data\encoders.py", line 420, in transform
+    raise KeyError(
+    ...<2 lines>...
+    )
+KeyError: "Unknown category 'loose' encountered. Set `add_nan=True` to allow unknown categories"

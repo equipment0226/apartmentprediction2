@@ -1,0 +1,117 @@
+Traceback (most recent call last):
+  File "C:\Users\equip\Desktop\homework\newtrial\step3\PITFT.py", line 970, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\equip\Desktop\homework\newtrial\step3\PITFT.py", line 955, in main
+    scenario_backtest(clean)
+    ~~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\equip\Desktop\homework\newtrial\step3\PITFT.py", line 733, in scenario_backtest
+    model, _ = train_tft(training, validation, log_subdir="backtest")
+               ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\Desktop\homework\newtrial\step3\PITFT.py", line 615, in train_tft
+    trainer.fit(tft, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\trainer\trainer.py", line 584, in fit
+    call._call_and_handle_interrupt(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        self,
+        ^^^^^
+    ...<6 lines>...
+        weights_only,
+        ^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\trainer\call.py", line 49, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\trainer\trainer.py", line 630, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path, weights_only=weights_only)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\trainer\trainer.py", line 1079, in _run
+    results = self._run_stage()
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\trainer\trainer.py", line 1123, in _run_stage
+    self.fit_loop.run()
+    ~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\loops\fit_loop.py", line 217, in run
+    self.advance()
+    ~~~~~~~~~~~~^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\loops\fit_loop.py", line 465, in advance
+    self.epoch_loop.run(self._data_fetcher)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\loops\training_epoch_loop.py", line 153, in run
+    self.advance(data_fetcher)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\loops\training_epoch_loop.py", line 352, in advance
+    batch_output = self.automatic_optimization.run(trainer.optimizers[0], batch_idx, kwargs)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\loops\optimization\automatic.py", line 192, in run
+    self._optimizer_step(batch_idx, closure)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\loops\optimization\automatic.py", line 270, in _optimizer_step
+    call._call_lightning_module_hook(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        trainer,
+        ^^^^^^^^
+    ...<4 lines>...
+        train_step_and_backward_closure,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\trainer\call.py", line 177, in _call_lightning_module_hook
+    output = fn(*args, **kwargs)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\core\module.py", line 1368, in optimizer_step
+    optimizer.step(closure=optimizer_closure)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\core\optimizer.py", line 154, in step
+    step_output = self._strategy.optimizer_step(self._optimizer, closure, **kwargs)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\strategies\strategy.py", line 239, in optimizer_step
+    return self.precision_plugin.optimizer_step(optimizer, model=model, closure=closure, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\plugins\precision\precision.py", line 123, in optimizer_step
+    return optimizer.step(closure=closure, **kwargs)
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\torch\optim\optimizer.py", line 533, in wrapper
+    out = func(*args, **kwargs)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\torch\optim\optimizer.py", line 81, in _use_grad
+    ret = func(*args, **kwargs)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\torch\optim\adam.py", line 227, in step
+    loss = closure()
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\plugins\precision\precision.py", line 109, in _wrap_closure
+    closure_result = closure()
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\loops\optimization\automatic.py", line 146, in __call__
+    self._result = self.closure(*args, **kwargs)
+                   ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\torch\utils\_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\loops\optimization\automatic.py", line 131, in closure
+    step_output = self._step_fn()
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\loops\optimization\automatic.py", line 319, in _training_step
+    training_step_output = call._call_strategy_hook(trainer, "training_step", *kwargs.values())
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\trainer\call.py", line 329, in _call_strategy_hook
+    output = fn(*args, **kwargs)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\strategies\strategy.py", line 391, in training_step
+    return self.lightning_module.training_step(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\Desktop\homework\newtrial\step3\PITFT.py", line 374, in training_step
+    self.log("pi_constraint_loss", constraint.detach(),
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+             prog_bar=True, on_step=False, on_epoch=True)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\pytorch_forecasting\models\base\_base_model.py", line 594, in log
+    super().log(*args, **kwargs)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\core\module.py", line 531, in log
+    results.log(
+    ~~~~~~~~~~~^
+        self._current_fx_name,
+        ^^^^^^^^^^^^^^^^^^^^^^
+    ...<14 lines>...
+        rank_zero_only=rank_zero_only,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\torch\_dynamo\eval_frame.py", line 1263, in _fn
+    return fn(*args, **kwargs)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\lightning\pytorch\trainer\connectors\logger_connector\result.py", line 409, in log
+    raise MisconfigurationException(
+        f"You called `self.log({name}, ...)` twice in `{fx}` with different arguments. This is not allowed"
+    )
+lightning.fabric.utilities.exceptions.MisconfigurationException: You called `self.log(pi_constraint_loss, ...)` twice in `training_step` with different arguments. This is not allowed
