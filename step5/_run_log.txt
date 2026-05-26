@@ -1,0 +1,31 @@
+[Load] panel ...
+[Clean] panel + log-return target ...
+[ADF] target stationarity report ...
+[ADF] stationary(0.05) = 0/243 dong
+[Technique log] 저장: C:\Users\equip\Desktop\homework\newtrial\step5\technique_log.csv  (26 entries)
+
+=== Scenario 1+2 : Backtest  (~2023-12-01 학습, 2024-01-01 ~ 2025-12-01 검증) ===
+[Backtest][M0] dong='개포동' 패널 저장: shape=(168, 21)
+[M1 log] transform_log 저장: C:\Users\equip\Desktop\homework\newtrial\step5\backtest_M1_transform_log.csv
+[Backtest][M2] lag=1  n_feat=21  resid_shape=(167, 21)
+[M2] VAR result 4종 저장: backtest_M2_var_*
+[M3+] p_rare(block)=0.0701  → N_hard=630
+[M3+] residual pool 저장: C:\Users\equip\Desktop\homework\newtrial\step5\backtest_M3plus_residual_pool.csv
+[scenarios] diff N=630 x H=24 x F=21 → C:\Users\equip\Desktop\homework\newtrial\step5\backtest_M3_scenarios_diff.csv
+[M5] policy 양자화: 10 변수, 임계값=±0.5 → {-1, 0, 1}
+[scenarios] level N=630 x H=24 x F=21 → C:\Users\equip\Desktop\homework\newtrial\step5\backtest_M5_scenarios_level.csv
+[M5] target_paths N=630 x H=24 (개별 시나리오 전체, +20 feature 컬럼) → C:\Users\equip\Desktop\homework\newtrial\step5\backtest_M5_target_paths.csv
+[Backtest][M4] violation_rate= {'T1_domain': 0.11746031746031746, 'T2_extreme': 1.0, 'T3_consistency': 0.06507936507936508, 'ANY': 1.0}
+[M4] realism report 저장: C:\Users\equip\Desktop\homework\newtrial\step5\backtest_M4_realism.csv
+[M5 bands] 저장 (backtest): C:\Users\equip\Desktop\homework\newtrial\step5\backtest_var_scenario_bands.csv
+
+[Backtest] training TFT  (target=residual_logret, dong=개포동) ...
+Epoch 11/39 ----------------- 2/2 0:00:01 • 0:00:00 1.45it/s v_num: 7.000      
+                                                             train_loss_step:  
+                                                             0.009 val_loss:   
+                                                             0.033             
+                                                             train_loss_epoch: 
+                                                             0.008             
+[VSN] 저장 완료: C:\Users\equip\Desktop\homework\newtrial\step5\backtest_vsn_weights.csv
+[TFT N-pass] N=630 시나리오 forward pass 시작 ...
+  scenario 63/630 완료

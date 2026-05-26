@@ -1,0 +1,25 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv/
+env/
+
+# ── 대용량 시나리오 CSV (100MB 초과, GitHub 업로드 불가) ─────────────────────
+# VAR M3 block-bootstrap 시나리오 (시나리오수 × horizon × 변수 → 수백MB)
+**/backtest_M3_scenarios_diff.csv
+**/future_M3_scenarios_diff.csv
+# VAR M5 원단위 복원 시나리오
+**/backtest_M5_scenarios_level.csv
+**/future_M5_scenarios_level.csv
+
+# ── PyTorch Lightning 학습 로그 / 체크포인트 ─────────────────────────────────
+lightning_logs/
+**/lightning_logs/
+*.ckpt
+*.pth
+
+# ── 기타 생성 결과물 (재실행으로 복원 가능) ──────────────────────────────────
+*.egg-info/
+.ipynb_checkpoints/

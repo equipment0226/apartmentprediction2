@@ -667,7 +667,8 @@ def save_interpretation(model: TemporalFusionTransformer,
         print(f"[Interp] {prefix} VSN/attention 저장 완료")
     except Exception as e:
         print(f"[Interp] 해석 산출 실패(무시): {e}")
-
+\475----------------------------------0p
+/0
 
 # ---------------------------------------------------------------------------
 # 공통 유틸 : raw 예측 → long-form DataFrame

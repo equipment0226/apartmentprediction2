@@ -1,0 +1,53 @@
+Traceback (most recent call last):
+  File "C:\Users\equip\Desktop\homework\newtrial\step5\var_tft.py", line 1924, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\equip\Desktop\homework\newtrial\step5\var_tft.py", line 1913, in main
+    scenario_backtest(clean)
+    ~~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\equip\Desktop\homework\newtrial\step5\var_tft.py", line 1279, in scenario_backtest
+    _save_target_paths_long(m5_out["target_paths"], fut_dates_bk,
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                             OUT_DIR / "backtest_M5_target_paths.csv",
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                             restored=m5_out["restored"],
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                             feature_cols=feature_cols,
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+                             target_col=TARGET_LEVEL_COL)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\Desktop\homework\newtrial\step5\var_tft.py", line 1169, in _save_target_paths_long
+    out.to_csv(save_path, index=False)
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\pandas\util\_decorators.py", line 333, in wrapper
+    return func(*args, **kwargs)
+  File "C:\Users\equip\anaconda3\Lib\site-packages\pandas\core\generic.py", line 3989, in to_csv
+    return DataFrameRenderer(formatter).to_csv(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        path_or_buf,
+        ^^^^^^^^^^^^
+    ...<14 lines>...
+        storage_options=storage_options,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\pandas\io\formats\format.py", line 1014, in to_csv
+    csv_formatter.save()
+    ~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\pandas\io\formats\csvs.py", line 251, in save
+    with get_handle(
+         ~~~~~~~~~~^
+        self.filepath_or_buffer,
+        ^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<4 lines>...
+        storage_options=self.storage_options,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ) as handles:
+    ^
+  File "C:\Users\equip\anaconda3\Lib\site-packages\pandas\io\common.py", line 873, in get_handle
+    handle = open(
+        handle,
+    ...<3 lines>...
+        newline="",
+    )
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\equip\\Desktop\\homework\\newtrial\\step5\\backtest_M5_target_paths.csv'
