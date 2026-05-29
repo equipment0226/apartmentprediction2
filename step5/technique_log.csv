@@ -1,0 +1,27 @@
+﻿module,sub_step,technique,key_params,formula,rationale
+M1,단위근 검정,Augmented Dickey-Fuller (ADF),alpha=0.05 | autolag=AIC,H0: unit root; p >= alpha → 비정상 → 차분,비정상 시계열은 VAR 계수가 spurious(허구)해짐; 차분 트리거를 자동으로 결정
+M1,1차 차분,First-order differencing,(ADF p >= alpha 인 변수만 자동 적용),diff(x)[t] = x[t] - x[t-1],우상향 trend 제거 → VAR 정상성 가정 충족; transform_log 에 기록해 M5 역변환
+M1,이상치 클리핑,Winsorization,lower=0.01 | upper=0.99,"x_clip = clip(x, quantile(x, lower), quantile(x, upper))",극단 outlier 가 VAR 계수 추정을 오염시키는 것 방지; 경제 가정 아닌 보수성 노브
+M1,결측 보간,Time-axis linear interpolation,method=time | limit_direction=both,x_t = x_a + (t-a)/(b-a)*(x_b - x_a),"월 단위 등간격 패널; 앞뒤 관측값 선형 연결로 결측 채움, cross-dong 누설 방지"
+M2,차수 선택,BIC-based lag selection,max_lag=12,"BIC = -2*logL + k*log(n); argmin over lag in [1, max_lag]",과적합 방지; 탐색 상한을 12로 넓혀 계절성 패턴 흡수 여유 확보
+M2,VAR 계수 추정,OLS per-equation VAR (statsmodels),"(statsmodels VAR.fit, lag=BIC 선택값)",Y_t = intercept + A_1*Y_{t-1} + ... + A_p*Y_{t-p} + u_t,다변량 시계열 선형 영향 관계를 방정식 단위 OLS로 추정; 잔차 u_t → M3 재료
+M2,사전분포 압축,Minnesota prior shrinkage (lambda=0.2),minnesota_lambda=0.2,coef_off_diag(L) *= (1 - 0.2/(L+1))  [L=0..lag-1],비대각(타변수) + 먼 시차일수록 0 쪽으로 당김; lambda=0.2은 BVAR 문헌 표준 중간값
+M3,충격 샘플링,Block bootstrap (block_size=3),block_size=3 | seed=42,shock_block = resid[rand_start : rand_start + block_size],"블록 크기 3=분기; 한 분기 동안 충격의 시간상관 보존, i.i.d. 가정 완화"
+M3,시나리오 전개,VAR multi-step simulation,horizon=240 | N >= hard_floor_N,Y_{t+1} = intercept + sum_L A_L*Y_{t-L+1} + shock_block[k],VAR 계수를 horizon 개월 반복 적용해 N개 경로 생성; M3+ 가 N을 하드조건으로 역산
+M3+,꼬리 보강,Student-t tail augmentation (df_init=5.0),t_df_init=5.0 | tail_prob=0.05 | fat_tail=True,"P(t-tail block) = 0.05; resid_j ~ t(df_j, loc_j, scale_j) MLE 적합",부동산 잔차 kurtosis>3 → Gaussian 꼬리 과소; df=5.0 t분포로 극단 충격 보강
+M3+,N 하드조건 역산,Binomial CDF inversion for N,k_min=30 | confidence=0.99 | extreme_quantile=0.98,"min N s.t. P(X >= 30) >= 0.99  where X ~ Binomial(N, p_rare)",직관 N 대신 '극단 충격을 0.99 확률로 30번 이상 뽑는 N'을 이항분포로 역산
+M4,정의역 검사 [T1],Hard domain constraint,HARD_DOMAIN dict (변수 정의 상수),"lo <= x_t <= hi  (예: 금리 >= 0, 수급지수 in [0,200])",물리적·정의상 불가한 값 검출; '경제 가정'이 아닌 '변수 정의' → 상수로 두어도 정당
+M4,급변 검사 [T2],Extreme change rate filter,realism_extreme_q=0.99,"|delta_x_t| > quantile(|delta_x_obs|, 0.99) → 위반 플래그",과거 월변화 상위 1.0% 초과 급변을 비현실 판정; 기준을 데이터에서 자동산출
+M4,부호 일관성 [T3],VAR residual sign consistency,corr_threshold=0.2 | pair_min_corr=0.3,"sign(rowcorr(delta_a, delta_b)) != sign(M2 resid corr) & |corr|>thresh → 위반",M2가 추정한 변수쌍 인과 방향이 시나리오에서 어긋남 검출; 기준이 추정 결과 → 하드코딩 아님
+M4,리포트 모드,Non-destructive flagging (report-only default),realism_mode=report,(기본) 경로 제거 없이 위반율 dict 만 반환,경로를 과도하게 버리면 시나리오 확률 비중 왜곡 (급락만 제거 → '급락없음' 편향)
+M5,원단위 역변환,Cumulative sum inversion,(transform_log 의 last_level + diff 여부),level[t] = last_level + sum_{i=1}^{t} diff[i],M1 차분의 역연산; 마지막 실제값 기준으로 누적합해 실제 집값 단위 복원
+M5,검증 채점,Coverage / Width / Rank scoring,(실제 미래값 존재 시 자동 계산),coverage=P(p10<=actual<=p90); width=mean(p90-p10); rank=mean(P(scen<actual)),포괄력(coverage) · 정보력(width) · 확률 정확도(rank) 3종 채점; 0.5 근처 rank가 이상적
+M5,군집화,Tercile clustering (post-hoc),하락/보합/상승 = 최종수익률 하위/중간/상위 1/3,final_ret = level[-1]/level[0]-1; argsort → split into thirds,시나리오를 먼저 자유 생성 후 사후 분류 → 기존 사전정의 방식의 편향 제거
+TFT,인코더,LSTM encoder (length=72),max_encoder_length=72 | hidden_size=96,"h_t = LSTM(embed(x_t), h_{t-1})",과거 72개월을 hidden state로 압축; 2020 boom + 2022 crash + 2023 회복 전체 포함
+TFT,변수 선택 (VSN),Variable Selection Network (VSN),hidden_continuous_size=24,"alpha_j = softmax(GRN(x_j, c)); x_tilde = sum_j alpha_j * GRN_j(x_j)",시점마다 변수별 중요도를 soft-attention으로 동적 산출; backtest/future_vsn_weights.csv에 저장
+TFT,어텐션,Multi-head self-attention (4 heads),attention_head_size=4 | hidden_size=96,"Attn(Q,K,V) = softmax(QK^T/sqrt(d_k))*V; 헤드 {ah}개 병렬 적용",decoder가 encoder의 관련 시점에 집중; head 수가 적을수록 해석 가능성 높음
+TFT,손실함수,Quantile Loss (Pinball Loss),"quantiles=[0.1, 0.5, 0.9]","QL(q,y,yhat) = q*max(y-yhat,0) + (1-q)*max(yhat-y,0)",점추정 대신 예측 구간(p10/p50/p90)을 직접 학습; 불확실성 정량화
+TFT,정규화,GroupNormalizer (center=True),groups=[dong] | transformation=None | center=True,x_norm = (x - mean_dong) / scale_dong,동별 평균 제거로 NN 수렴 안정화; log-return은 scale 이미 작으므로 transformation=None
+TFT,학습 가중치,Recency exponential weighting,recency_halflife_months=36,w(t) = 0.5^((t_max - t) / 36),반감기 36개월; 최근 regime 주세 학습 + 과거 데이터도 일부 반영
+TFT,잔차 보정,Hybrid VAR+TFT residual boosting,residual_mode=True,pred_final = VAR_baseline_logret + TFT(target_logret - VAR_baseline_logret),VAR 이 못 잡는 동별 이질성·비선형·정책 충격을 TFT가 잔차로 학습; boosted ensemble
+TFT,옵티마이저,AdamW + EarlyStopping,lr=0.001 | gradient_clip=0.035 | early_stop_patience=3,theta_{t+1} = theta_t - lr*(m_t/(sqrt(v_t)+eps) + lambda*theta_t),원논문 TFT 표 4 기준; gradient clip=0.1으로 exploding gradient 방지

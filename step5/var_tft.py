@@ -80,7 +80,7 @@ if hasattr(sys.stdout, "reconfigure"):
 warnings.filterwarnings("ignore")
 
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -142,7 +142,7 @@ TARGET_DONG      = "개포동"
 TRAIN_END   = "2023-12-01"   # 백테스트 학습 종료
 VALID_START = "2024-01-01"
 VALID_END   = "2025-12-01"   # (백테스트 기본 horizon = 24개월)
-FUTURE_END  = "2035-12-01"   # 미래 예측 종료 (10년)
+FUTURE_END  = "2045-12-01"   # 미래 예측 종료 (10년)
 
 
 # ===========================================================================
@@ -161,7 +161,7 @@ VAR_CFG = dict(
                               # 0.0 = 일반 VAR (과적합), 1.0 = AR(1) 강제(과소적합).
 
     # M3) Block bootstrap
-    horizon=120,              # 미래 시나리오 길이 (개월). FUTURE_END 와 정합.
+    horizon=240,              # 미래 시나리오 길이 (개월). FUTURE_END 와 정합.
     n_scenarios=100,          # ★ 사용자 지정 하한. 실제 생성 수는 M3+ 하드조건으로
                               #   자동 상향되므로 이 값이 그대로 쓰이는 경우는 드물다.
                               #   현재 설정(extreme_quantile=0.98, block_size=3,
@@ -232,36 +232,47 @@ VAR_CFG = dict(
 # 0-2. TFT 노브  (step2/TFT.py 와 동일 키 + 본 파일 고유 키 일부 추가)
 # ===========================================================================
 TFT_CFG = dict(
-    max_encoder_length=60,   # encoder(과거) 길이 = 5년. 2020 boom + 2022 crash
+    max_encoder_length=72,   # encoder(과거) 길이 = 5년. 2020 boom + 2022 crash
                              # + 2023 회복 regime 전환을 한 윈도우에 담음.
 
     backtest_pred_len= 24,    # 백테스트 horizon (개월) = VALID 길이. // BVAR공통
-    future_pred_len=120,     # 미래 horizon (개월) = 10년. VAR_CFG.horizon 과 정합.
+    future_pred_len=240,     # 미래 horizon (개월) = 10년. VAR_CFG.horizon 과 정합.
 
-    hidden_size=8,          # TFT 핵심 hidden dim. encoder 5년에 맞춰 32.
-    attention_head_size=1,   # multi-head attn. hidden 32 → 2 head 적정.
-    dropout=0.25,             # 과적합 방지. 원논문 디폴트.
-    hidden_continuous_size=8,  # 연속변수 임베딩 dim = hidden_size//4.
-    weight_decay=1e-3,        # AdamW L2 weight decay. 비현실적인 발산 규제
+    hidden_size=96,          # TFT 핵심 hidden dim. encoder 5년에 맞춰 32.→ 8 조정
+    attention_head_size=4,   # multi-head attn. hidden 32 → 2 head 적정. → 1 조정 
+    dropout=0.2,             # 과적합 방지. 원논문 디폴트 0.1 → 0.25 조정
+    hidden_continuous_size=24,  # 연속변수 임베딩 dim = hidden_size//4.
+    weight_decay=3e-4,        # AdamW L2 weight decay. 비현실적인 발산 규제
 
     learning_rate=1e-3,      # AdamW. encoder 5년 + log-return 타겟 → 작은 LR 안정.
     batch_size=64,           # CPU 메모리 + Lightning subprocess overhead 절충.
-    max_epochs=40,           # 충분 + EarlyStopping 으로 자동 종료.
-    gradient_clip_val=0.03,   # 원논문 표 4 권장값.
-    early_stop_patience=3,   # val_loss 8 epoch 정체시 중단.
-    recency_halflife_months=72,  # weight(t) = 0.5^((t_max-t)/halflife).
-                                  # 48개월(4년) — 2020+ regime 주세, 과거도 일부 반영.
+    max_epochs=30,           # 충분 + EarlyStopping 으로 자동 종료.
+    gradient_clip_val=0.035,   # 원논문 표 4 권장값.
+    early_stop_patience=3,   # val_loss 8 epoch 정체시 중단. (3 → 8 완화)
+    recency_halflife_months=36,  # weight(t) = 0.5^((t_max-t)/halflife).
+                                  # 10년 반감기 — 2010~2018 다른 체제 표본도
+                                  # regime 전환 학습에 필요. 72 → 120 완화.
     num_workers=0,           # Windows: spawn freeze 회피.
     quantiles=[0.1, 0.5, 0.9],   # 중앙값 + 80% 예측구간.
 
     # --- 본 파일 고유 ---
     residual_mode=True,      # True : VAR baseline 을 빼고 TFT 가 잔차만 학습.
                              # False: TFT 단독 학습 (비교/ablation 용).
+    # --- [Patch A] baseline 모드 ---
+    #   "deterministic" : 추론 시 모든 시나리오에 VAR conditional mean(충격 0)을
+    #     baseline 으로 주입 → 학습 시(in-sample fitted = 조건부 평균)와
+    #     통계적 의미 일치. 시나리오 간 차이는 known_reals(feature 경로)로만 표현.
+    #     → 잔차의 본래 의미("VAR 평균이 못 잡는 비선형/급변") 보존.
+    #   "per_scenario" : 기존 동작(시나리오별 충격포함 경로를 baseline 으로 사용).
+    #     학습/추론 분포 불일치 → 발산. ablation 비교용으로만 유지.
+    baseline_mode="deterministic",
     # --- hybrid 잔차 발산(fan-out) 제어 ---
     #   level_p10/p90 = last_price * exp(cumsum(hybrid_p10/p90)) 구조에서
     #   quantile 별로 24~120 step 을 그대로 누적하면 P10/P90 spread 가
     #   기하급수적으로 폭주(상관 1.0 worst-case). 아래 3 knob 으로 통제.
-    residual_decay=0.88,     # 잔차 영향력의 월별 fade. rp_t *= decay**t.
+    residual_decay=0.99,      # [Patch C] baseline 분포 불일치를 Patch A 로 해결했으므로
+                             # 출력 압축 노브 모두 OFF. 1.0 = decay 끔.
+                             # (구) 0.88 — 잔차 영향력의 월별 fade. rp_t *= decay**t.
                               # 1.0 = decay 끔, 0.90 ≈ 1년 후 영향 ~28%.
                               # 부동산은 mean-reverting → 0.85~0.95 권장.
                               # 근거 : Mean-reversion / shrinkage to prior 아이디어 — Hyndman 계열 forecast 교과서, ETS의 damped trend(Gardner & McKenzie 1985, forecast::holt(damped=TRUE) 의 φ 파라미터)와 동일한 형식. φ∈[0.8, 0.98] 권장 범위에서 중앙값 채택.
@@ -269,11 +280,16 @@ TFT_CFG = dict(
                               # 0.025 ≈ ±2.5%/월 → 단일 step 으로는 충분히 크고,
                               # 누적 발산은 차단. None 이면 cap 끔.
                               # 근거 : Gradient/output clipping 일반론. 월간 ±2.5% logret은 한국 아파트 월변동성 σ≈2.0%(2010-2025 KB지수 기준)의 ~1.25σ. "이상치는 자르되 정상 변동은 살린다"는 winsorize 정신.
-    hybrid_alpha=0.25,        # hybrid = alpha * residual + baseline.
+    hybrid_alpha=1.0,         # [Patch C] 1.0 = 잔차 전량 반영.
+                             # (구) 0.25 — boosting shrinkage. baseline 분포
+                             # 불일치 가리기용. Patch A 로 더 이상 불필요.
+                             # hybrid = alpha * residual + baseline.
                               # 1.0 = 잔차 전량 반영, 0.0 = VAR 단독으로 회귀.
                               # 0.5~0.7 이 보통 sharpness-coverage trade-off 최적.
                               # 근거 : Boosting의 learning rate (shrinkage) — Friedman 2001 "Greedy Function Approximation" §4. GBM의 ν 파라미터(0.050.3)와 같은 역할이되, 여기는 1-step 잔차 추가라 더 큰 값(0.7)이 합리적.
-    hybrid_quantile_shrink=0.20,
+    hybrid_quantile_shrink=1.0,   # [Patch C] 1.0 = TFT quantile 원본 유지.
+                                  # (구) 0.20 — p10/p90 → p50 압축. 누적 발산
+                                  # 가리기용. Patch A 로 더 이상 불필요.
                               # p10/p90 의 중앙 회귀 정도(p50 쪽으로).
                               # 1.0 = TFT quantile 원본, 0.0 = 전부 p50 으로 붕괴.
                               # 24~120 step cumsum 발산을 추가 압축.
@@ -859,6 +875,65 @@ def var_baseline_logret(restored_target_paths: np.ndarray,
     return out.astype(np.float32)
 
 
+def var_deterministic_future_logret(var_result: Dict,
+                                     stat_df: pd.DataFrame,
+                                     tlog: Dict,
+                                     last_price: float,
+                                     horizon: int,
+                                     feature_cols: List[str],
+                                     target_col: str) -> np.ndarray:
+    """[Patch A] VAR conditional-mean future path → target log-return (horizon,).
+
+    [목적]
+      추론 단계 TFT baseline 의 통계적 정의를 학습 단계와 일치시킴.
+      - 학습 baseline = VAR in-sample fitted log-return (= 조건부 평균)
+      - 기존 추론 baseline = M3 bootstrap 시나리오별 충격 포함 경로
+        → 충격이 baseline 에 섞여 들어가 TFT 잔차가 본래 의미(잔차)에서 이탈.
+      - 본 함수는 충격을 0 으로 두고 VAR 자체의 평균 경로만 산출.
+
+    [동작]
+      1) recent ← stat_df 의 마지막 lag 행 (정상화 공간)
+      2) for t in horizon:
+           mean_next = intercept + Σ coef[L] @ recent[-L-1]   (충격 없음)
+           recent ← (recent + mean_next) [-lag:]
+      3) tlog 의 diff 여부에 따라 target 채널만 level 복원
+         (diff: last_level + cumsum 으로 절대수준; non-diff: 그대로)
+      4) level → 1 단계 log-return 으로 변환 (last_price 가 t=0 직전 시점)
+    """
+    coef       = var_result["coef"]                # (lag, n_feat, n_feat)
+    lag        = int(var_result["lag"])
+    intercept  = var_result["intercept"]
+    n_feat     = len(feature_cols)
+    tgt_idx    = feature_cols.index(target_col)
+
+    init   = stat_df[feature_cols].values[-lag:].astype(np.float64)
+    recent = init.copy()
+    mean_path = np.zeros((horizon, n_feat), dtype=np.float64)
+    for t in range(horizon):
+        mean_next = (intercept.copy()
+                     if intercept is not None else np.zeros(n_feat))
+        for L in range(lag):
+            mean_next = mean_next + coef[L] @ recent[-(L + 1)]
+        mean_path[t] = mean_next
+        recent = np.vstack([recent, mean_next])[-lag:]
+
+    # diff 였다면 cumsum 복원, 아니면 그대로
+    info = tlog.get(target_col, {"diff": False})
+    if info.get("diff", False):
+        level = float(info["last_level"]) + np.cumsum(mean_path[:, tgt_idx])
+    else:
+        level = mean_path[:, tgt_idx]
+
+    # level → log-return (이전월 대비)
+    logret = np.zeros(horizon, dtype=np.float32)
+    prev = max(float(last_price), 1e-9)
+    for t in range(horizon):
+        cur = max(float(level[t]), 1e-9)
+        logret[t] = float(np.log(cur / prev))
+        prev = cur
+    return logret
+
+
 # ===========================================================================
 # ============================  TFT 파이프라인  ============================
 # ===========================================================================
@@ -879,6 +954,12 @@ def prepare_for_tft(df: pd.DataFrame) -> pd.DataFrame:
     policy_cols = [c for c in out.columns if c.startswith("policy__")]
     for c in policy_cols:
         out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).astype(np.float32)
+        # 정책 효과 3개월 지연 반영: lag3 컬럼 추가 (dong별 groupby)
+        lag_col = f"{c}_lag3"
+        out[lag_col] = (
+            out.groupby("dong", group_keys=False)[c]
+               .shift(3).fillna(0.0).astype(np.float32)
+        )
 
     # Recency weighted loss : 2020+ regime 주세 학습.
     t_max = int(out["time_idx"].max())
@@ -1010,15 +1091,30 @@ def train_tft(training: TimeSeriesDataSet, validation: TimeSeriesDataSet,
 
 
 def _decode_predictions(pred_out, idx_to_ts: Dict[int, pd.Timestamp],
-                        group_map: Dict[int, str]) -> pd.DataFrame:
-    """raw prediction → long-form DataFrame (dong, timestamp, p10/p50/p90)."""
+                        group_map=None,
+                        dataset: Optional[TimeSeriesDataSet] = None) -> pd.DataFrame:
+    """raw prediction → long-form DataFrame (dong, timestamp, p10/p50/p90).
+
+    group_map(dict[int -> dong명]) 가 주어지면 그것을 우선 사용한다.
+    그렇지 않고 dataset 이 주어지면 dataset.x_to_index(x) 로 dong 컬럼을
+    안전하게 디코딩한다 (group_ids encoder 이름이 버전마다 다른 문제 회피).
+    """
     raw, x = pred_out.output, pred_out.x
     pred_q = raw["prediction"].detach().cpu().numpy()
     q = TFT_CFG["quantiles"]
     qi_med = q.index(0.5)
     decoder_time_idx = x["decoder_time_idx"].detach().cpu().numpy()
-    group_ids = x["groups"].detach().cpu().numpy()
-    dong_names = [group_map[int(g[0])] for g in group_ids]
+
+    if group_map is not None:
+        group_ids = x["groups"].detach().cpu().numpy()
+        dong_names = [group_map[int(g[0])] for g in group_ids]
+    elif dataset is not None:
+        idx_df = dataset.x_to_index(x)
+        # x_to_index 는 batch 행마다 (dong, time_idx) 를 디코딩해 줌.
+        # 행 순서는 pred_q 의 0차원 순서와 동일.
+        dong_names = idx_df["dong"].astype(str).tolist()
+    else:
+        raise ValueError("_decode_predictions: group_map 또는 dataset 중 하나는 필요")
 
     records = []
     for i, dong in enumerate(dong_names):
@@ -1411,7 +1507,9 @@ def _tft_predict_per_scenario(model,
                                last_obs_idx: pd.Timestamp,
                                last_price: float,
                                horizon: int,
-                               baseline_past_map: Dict[pd.Timestamp, float] = None) -> Dict[str, np.ndarray]:
+                               baseline_past_map: Dict[pd.Timestamp, float] = None,
+                               deterministic_baseline_seq: np.ndarray = None,
+                               target_dong: str = None) -> Dict[str, np.ndarray]:
     """학습된 TFT 모델 + N개 VAR 시나리오 → N개 hybrid 경로.
 
     각 시나리오 s 에 대해:
@@ -1427,6 +1525,13 @@ def _tft_predict_per_scenario(model,
     """
     N_scen = restored.shape[0]
     tft_target = "residual_logret" if TFT_CFG["residual_mode"] else TARGET_COL
+    baseline_mode = TFT_CFG.get("baseline_mode", "deterministic")
+
+    # [Patch B] 추론용 panel 은 target_dong 만 사용 — full panel 이 들어와도 필터.
+    if target_dong is not None and "dong" in panel_dong_logret.columns:
+        panel_dong_logret = panel_dong_logret[
+            panel_dong_logret["dong"] == target_dong
+        ].copy()
 
     raw_p10  = np.zeros((N_scen, horizon))
     raw_p50  = np.zeros((N_scen, horizon))
@@ -1453,15 +1558,47 @@ def _tft_predict_per_scenario(model,
                           for d in past_dates}
 
     progress_every = max(1, N_scen // 10)
-    print(f"[TFT N-pass] N={N_scen} 시나리오 forward pass 시작 ...")
+    print(f"[TFT N-pass] N={N_scen} 시나리오 forward pass 시작 "
+          f"(baseline_mode={baseline_mode}) ...")
+
+    # [Patch A] deterministic 모드 : N 번 동일한 baseline_seq 사용.
+    det_seq = None
+    if baseline_mode == "deterministic":
+        if deterministic_baseline_seq is None:
+            raise ValueError(
+                "baseline_mode='deterministic' 이지만 deterministic_baseline_seq 가 없음. "
+                "호출자에서 var_deterministic_future_logret(...) 을 먼저 산출해 주입하세요."
+            )
+        det_seq = np.asarray(deterministic_baseline_seq, dtype=np.float32)[:horizon]
+        if len(det_seq) < horizon:
+            det_seq = np.concatenate(
+                [det_seq, np.zeros(horizon - len(det_seq), np.float32)]
+            )
 
     for s in range(N_scen):
-        # 1) 시나리오 s 의 baseline logret
-        baseline_seq = var_baseline_logret(
+        # 1) baseline logret —— [Patch A2] TFT 입력용 / 출력 합산용 분리
+        #
+        #   TFT 입력 (var_baseline_logret known_real) :
+        #     baseline_mode='deterministic' → 모든 s 동일 (det_seq)
+        #       → 학습 시 본 in-sample fitted 와 통계 의미 일치(조건부 평균).
+        #       → TFT 잔차는 "VAR 평균이 못 잡는 비선형 성분" 으로 해석 보존.
+        #     baseline_mode='per_scenario' → 시나리오별 경로(ablation 비교용).
+        #
+        #   최종 hybrid 합산 baseline (output) :
+        #     항상 per-scenario VAR 경로의 log-return 을 사용.
+        #     → M3 bootstrap 이 만든 N개 충격 다양성이 출력에 그대로 살아남.
+        #     → 최종식 : hybrid[s,t] = var_path_s_logret[t] + TFT_residual[s,t]
+        #               = (det_mean[t] + shock_s[t]) + TFT_residual[s,t]
+        per_scen_baseline_seq = var_baseline_logret(
             target_paths[s][None, :], last_price
         )[0]
-        baseline_map_s = {d: float(v) for d, v in zip(fut_dates, baseline_seq)}
-        baseline[s] = baseline_seq
+        if baseline_mode == "deterministic":
+            tft_input_baseline_seq = det_seq
+        else:   # per_scenario — 입력/출력 모두 시나리오 경로 (legacy)
+            tft_input_baseline_seq = per_scen_baseline_seq
+
+        baseline_map_s = {d: float(v) for d, v in zip(fut_dates, tft_input_baseline_seq)}
+        baseline[s] = per_scen_baseline_seq   # 출력 합산용을 기록(시나리오 다양성 보존)
 
         # 2) future_rows : 단일 동 + scenario s 의 feature 경로
         future_rows = []
@@ -1493,8 +1630,10 @@ def _tft_predict_per_scenario(model,
         idx_to_ts = (df_s[["time_idx", TIME_COL]].drop_duplicates()
                                                   .set_index("time_idx")[TIME_COL]
                                                   .to_dict())
-        group_map = {i: d for i, d in enumerate(sorted(df_s["dong"].unique()))}
-        pred_df_s = _decode_predictions(pred_out, idx_to_ts, group_map)
+        # [Fix] group_ids 의 정수 label 은 학습 시 부여된 값이라
+        # df_s 만으로 매핑하면 어긋남. dataset.x_to_index 로 안전 디코딩.
+        pred_df_s = _decode_predictions(pred_out, idx_to_ts,
+                                        dataset=predict_ds_s)
         pred_df_s = pred_df_s.sort_values("timestamp").head(horizon)
 
         rp10 = pred_df_s["pred_p10"].values[:horizon]
@@ -1542,9 +1681,11 @@ def _tft_predict_per_scenario(model,
         rp90_s = a * rp90_s
 
         if TFT_CFG["residual_mode"]:
-            hyb_p10[s] = rp10_s + baseline_seq
-            hyb_p50[s] = rp50_s + baseline_seq
-            hyb_p90[s] = rp90_s + baseline_seq
+            # [Patch A2] 출력 합산은 항상 per-scenario VAR 경로 사용
+            # → N개 시나리오 다양성(M3 shock) 출력에 반영.
+            hyb_p10[s] = rp10_s + per_scen_baseline_seq
+            hyb_p50[s] = rp50_s + per_scen_baseline_seq
+            hyb_p90[s] = rp90_s + per_scen_baseline_seq
         else:
             hyb_p10[s] = rp10_s
             hyb_p50[s] = rp50_s
@@ -1684,14 +1825,17 @@ def scenario_backtest(panel_logret: pd.DataFrame) -> Dict:
                              OUT_DIR / "backtest_var_scenario_bands.csv",
                              scenario_tag="backtest")
 
-    # --- 5) TFT 1회 학습 (단일 동, In-Sample VAR baseline) ---
+    # --- 5) TFT 1회 학습 ([Patch B] full panel pooling + In-Sample VAR baseline) ---
     #   과거 학습 구간에 VAR fitted log-return 을 baseline 으로 부여 →
     #   residual_logret = target_logret - fitted_logret 가 진정한 잔차.
     #   (baseline=0 로 두면 추론 시 시나리오 baseline 합산으로 double counting)
+    #   [Patch B] 학습은 panel_logret 전체(243개 동)로 → static 임베딩(gu,dong)
+    #            이 비로소 의미 가짐. VAR baseline 은 timestamp 키로 모든 동에
+    #            broadcast 되어 cross-section 잔차 학습.
     baseline_full_train = var_in_sample_baseline_map(
         var_result, stat_df, tlog, panel_dong, feature_cols
     )
-    panel_aug_train = attach_var_baseline(panel_dong, baseline_full_train)
+    panel_aug_train = attach_var_baseline(panel_logret, baseline_full_train)
     tft_target = "residual_logret" if TFT_CFG["residual_mode"] else TARGET_COL
 
     df_train = prepare_for_tft(panel_aug_train)
@@ -1702,8 +1846,9 @@ def scenario_backtest(panel_logret: pd.DataFrame) -> Dict:
     validation = TimeSeriesDataSet.from_dataset(
         training, df_train, predict=True, stop_randomization=True
     )
+    n_dongs_train = df_train["dong"].nunique()
     print(f"\n[Backtest] training TFT  (target={tft_target}, "
-          f"dong={TARGET_DONG}) ...")
+          f"panel pooling: {n_dongs_train} dongs, inference dong={TARGET_DONG}) ...")
     model, _ = train_tft(training, validation, log_subdir="backtest")
 
     # VSN 가중치 저장 (학습 모델 기준 — predict 1회 후 추출)
@@ -1716,9 +1861,18 @@ def scenario_backtest(panel_logret: pd.DataFrame) -> Dict:
     del _vsn_pred
 
     # --- 6) N 개 시나리오 forward pass ---
+    #   [Patch A] deterministic baseline : 학습 시 사용한 in-sample fitted 와
+    #            동일한 통계적 의미(VAR 조건부 평균)를 갖는 미래 경로를 산출.
+    #            모든 시나리오에 동일 baseline 을 주입 → TFT 잔차의 본래 의미
+    #            ("VAR 평균이 못 잡는 비선형/급변") 유지.
+    det_baseline_seq = var_deterministic_future_logret(
+        var_result=var_result, stat_df=stat_df, tlog=tlog,
+        last_price=last_price, horizon=horizon,
+        feature_cols=feature_cols, target_col=TARGET_LEVEL_COL,
+    )
     pump_out = _tft_predict_per_scenario(
         model=model, training=training,
-        panel_dong_logret=panel_dong,
+        panel_dong_logret=panel_logret,
         restored=m5_out["restored"],
         target_paths=m5_out["target_paths"],
         feature_cols=feature_cols,
@@ -1727,6 +1881,8 @@ def scenario_backtest(panel_logret: pd.DataFrame) -> Dict:
         last_price=last_price,
         horizon=horizon,
         baseline_past_map=baseline_full_train,
+        deterministic_baseline_seq=det_baseline_seq,
+        target_dong=TARGET_DONG,
     )
     _save_n_hybrid_paths(pump_out, fut_dates_bk,
                           OUT_DIR / "backtest_hybrid_scenarios.csv",
@@ -1870,12 +2026,13 @@ def scenario_future(panel_logret: pd.DataFrame) -> Dict:
 
     last_obs_idx = panel_dong[TIME_COL].max()
 
-    # --- TFT 1회 학습 (단일 동 전체 history, In-Sample VAR baseline) ---
+    # --- TFT 1회 학습 ([Patch B] full panel pooling + In-Sample VAR baseline) ---
     #   double counting 방지: 과거 구간 baseline = VAR fitted log-return.
+    #   [Patch B] 학습은 panel_logret 전체로 → 동별 cross-section pooling.
     baseline_full_train = var_in_sample_baseline_map(
         var_result, stat_df, tlog, panel_dong, feature_cols
     )
-    panel_aug_train = attach_var_baseline(panel_dong, baseline_full_train)
+    panel_aug_train = attach_var_baseline(panel_logret, baseline_full_train)
     tft_target = "residual_logret" if TFT_CFG["residual_mode"] else TARGET_COL
 
     df_train = prepare_for_tft(panel_aug_train)
@@ -1883,11 +2040,22 @@ def scenario_future(panel_logret: pd.DataFrame) -> Dict:
                                "time_idx"].iloc[0])
     training = build_training_dataset(df_train, training_cutoff=cutoff,
                                       max_pred_len=horizon, target=tft_target)
+    # [Fix] future 모드는 cutoff 이후 실데이터가 없어 predict=True 로 horizon(240)
+    # decoder window 를 자를 수 없음 → AssertionError("filters should not remove
+    # all entries"). validation 은 VSN 추출/EarlyStopping 용도이므로 짧은
+    # in-sample window 로 슬라이싱해도 무방. 마지막 12 개월을 decoder 로 사용.
+    _val_pred_len = min(TFT_CFG["backtest_pred_len"], 12)
+    _val_cutoff = cutoff - _val_pred_len
     validation = TimeSeriesDataSet.from_dataset(
-        training, df_train, predict=True, stop_randomization=True
+        training, df_train, predict=True, stop_randomization=True,
+        max_prediction_length=_val_pred_len,
+        min_prediction_length=1,
+        min_prediction_idx=_val_cutoff + 1,
     )
+    n_dongs_train = df_train["dong"].nunique()
     print(f"\n[Future] training TFT (target={tft_target}, horizon={horizon}, "
-          f"dong={TARGET_DONG}) ...")
+          f"panel pooling: {n_dongs_train} dongs, "
+          f"inference dong={TARGET_DONG}) ...")
     model, _ = train_tft(training, validation, log_subdir="future")
 
     # VSN 가중치 저장
@@ -1900,9 +2068,15 @@ def scenario_future(panel_logret: pd.DataFrame) -> Dict:
     del _vsn_pred
 
     # --- N 개 시나리오 forward pass ---
+    #   [Patch A] deterministic baseline 주입 → 학습/추론 baseline 통계 의미 일치.
+    det_baseline_seq = var_deterministic_future_logret(
+        var_result=var_result, stat_df=stat_df, tlog=tlog,
+        last_price=last_price, horizon=horizon,
+        feature_cols=feature_cols, target_col=TARGET_LEVEL_COL,
+    )
     pump_out = _tft_predict_per_scenario(
         model=model, training=training,
-        panel_dong_logret=panel_dong,
+        panel_dong_logret=panel_logret,
         restored=m5_out["restored"],
         target_paths=m5_out["target_paths"],
         feature_cols=feature_cols,
@@ -1911,6 +2085,8 @@ def scenario_future(panel_logret: pd.DataFrame) -> Dict:
         last_price=last_price,
         horizon=horizon,
         baseline_past_map=baseline_full_train,
+        deterministic_baseline_seq=det_baseline_seq,
+        target_dong=TARGET_DONG,
     )
     _save_n_hybrid_paths(pump_out, fut_dates_f,
                           OUT_DIR / "future_hybrid_scenarios.csv",

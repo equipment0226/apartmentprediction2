@@ -1,0 +1,7 @@
+item,value,note
+violation_rate__T1_domain,0.11746031746031746,
+violation_rate__T2_extreme,1.0,
+violation_rate__T3_consistency,0.06507936507936508,
+violation_rate__ANY,1.0,
+pair_sign__reb__apt_sale_avg_price|reb__apt_jeonse_avg_price,1.0,M2 resid corr 부호 기준
+realism_mode,,report
